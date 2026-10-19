@@ -1,0 +1,51 @@
+name: Build 3DS (PCSX ReARMed stereo)
+
+# Ручной запуск: вкладка Actions -> "Build 3DS ..." -> Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: reallibretroretroarch/libretro-build-devkitpro:latest
+      options: --user root
+
+    steps:
+    - uses: taiki-e/checkout-action@v1
+
+    - name: Get RetroArch sources
+      run: git clone --depth 1 https://github.com/libretro/RetroArch.git ra
+
+    - name: Build core (static library for 3DS)
+      run: |
+        make -f Makefile.libretro platform=ctr -j$(getconf _NPROCESSORS_ONLN)
+        ls -l *.a
+
+    - name: Put core into RetroArch tree
+      run: cp pcsx_rearmed_libretro_ctr.a ra/libretro_ctr.a
+
+    - name: Build RetroArch with the core
+      working-directory: ra
+      run: |
+        make -f Makefile.ctr -j$(getconf _NPROCESSORS_ONLN) USE_CTRULIB_2=1 LIBRETRO=pcsx_rearmed clean
+        make -f Makefile.ctr -j$(getconf _NPROCESSORS_ONLN) USE_CTRULIB_2=1 LIBRETRO=pcsx_rearmed all
+        ls -l retroarch_3ds.*
+
+    - name: Collect result
+      run: |
+        mkdir -p out
+        cp ra/retroarch_3ds.cia ra/retroarch_3ds.3dsx ra/retroarch_3ds.smdh out/ 2>/dev/null || true
+        ls -l out
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: pcsx-rearmed-3ds-stereo
+        path: out/
