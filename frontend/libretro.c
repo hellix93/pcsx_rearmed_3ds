@@ -110,6 +110,36 @@ static retro_log_printf_t log_cb;
 
 static unsigned msg_interface_version = 0;
 
+/* --- stereo 3D (libretro "video views") support, see stereo3d section --- */
+#ifndef RETRO_ENVIRONMENT_SET_VIDEO_VIEWS
+/* Local copy of the definitions from newer libretro.h (RetroArch master),
+ * so that the bundled older header still compiles. Layout must match. */
+#define RETRO_ENVIRONMENT_SET_VIDEO_VIEWS (95 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+#define RETRO_ENVIRONMENT_GET_VIDEO_VIEWS_STATUS (96 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+#define RETRO_VIDEO_VIEWS_STATUS_PRESENTS (1 << 0)
+#define RETRO_VIDEO_VIEWS_STATUS_STEREO   (1 << 1)
+#define RETRO_VIDEO_VIEW_EYE_NONE  0
+#define RETRO_VIDEO_VIEW_EYE_LEFT  1
+#define RETRO_VIDEO_VIEW_EYE_RIGHT 2
+struct retro_video_view
+{
+   unsigned x, y, width, height;
+   unsigned screen;
+   unsigned eye;
+   float aspect_ratio;
+};
+struct retro_video_views
+{
+   const struct retro_video_view *views;
+   unsigned num_views;
+   unsigned flags;
+   int reference_space; /* enum in libretro.h, int sized */
+   unsigned recommended_view_width;
+   unsigned recommended_view_height;
+};
+#endif
+static void *stereo_buf;
+static bool stereo_map_sent;
 static void *vout_buf;
 static void *vout_buf_ptr;
 static int vout_width = 256, vout_height = 240, vout_pitch_b = 256*2;
@@ -3499,6 +3529,90 @@ static void print_internal_fps(void)
 static bool get_bios_config_hle(void);
 static void prepare_bios(bool use_hle);
 
+#define STEREO_TEST_SHIFT 4 /* pixels, stage 1 only */
+
+/* ---- stereo3d section ----
+ * Packs the finished frame as [left eye | right eye] side by side and tells
+ * the frontend where each eye is. Stage 1: both eyes are identical (flat
+ * image shown through the stereo path) to verify the output chain. */
+static bool stereo_wanted(void)
+{
+   unsigned status = 0;
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_VIDEO_VIEWS_STATUS, &status))
+      return false;
+   return (status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS)
+       && (status & RETRO_VIDEO_VIEWS_STATUS_STEREO);
+}
+
+static void stereo_send_map(int w, int h)
+{
+   struct retro_video_view v[2];
+   struct retro_video_views views;
+
+   memset(v, 0, sizeof(v));
+   v[0].x = 0;      v[0].y = 0; v[0].width = w; v[0].height = h;
+   v[0].screen = 0; v[0].eye = RETRO_VIDEO_VIEW_EYE_LEFT;
+   v[0].aspect_ratio = 4.0f / 3.0f;
+   v[1]       = v[0];
+   v[1].x     = w;
+   v[1].eye   = RETRO_VIDEO_VIEW_EYE_RIGHT;
+
+   memset(&views, 0, sizeof(views));
+   views.views     = v;
+   views.num_views = 2;
+   if (environ_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS, &views)) {
+      if (!stereo_map_sent)
+         SysPrintf("stereo3d: views map accepted (%dx%d per eye)\n", w, h);
+      stereo_map_sent = true;
+   }
+}
+
+static void stereo_clear_map(void)
+{
+   struct retro_video_views views;
+   if (!stereo_map_sent)
+      return;
+   memset(&views, 0, sizeof(views));
+   environ_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS, &views);
+   stereo_map_sent = false;
+   SysPrintf("stereo3d: views map cleared\n");
+}
+
+/* returns true if the packed frame was sent */
+static bool stereo_present(void)
+{
+   int bytes_pp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
+   int row_b, shift_b, y;
+   const unsigned char *src = vout_buf_ptr;
+   unsigned char *dst = stereo_buf;
+
+   if (!stereo_wanted() || !stereo_buf || !src
+       || vout_width <= 0 || vout_height <= 0
+       || vout_width * 2 > VOUT_MAX_WIDTH) {
+      stereo_clear_map();
+      return false;
+   }
+
+   row_b = vout_width * bytes_pp;
+   shift_b = STEREO_TEST_SHIFT * bytes_pp;
+   if (shift_b >= row_b)
+      shift_b = 0;
+   for (y = 0; y < vout_height; y++) {
+      /* left eye: the frame as is */
+      memcpy(dst, src, row_b);
+      /* right eye (stage 1 test): same frame moved right by a constant,
+       * so the whole picture floats at one fixed depth behind the screen */
+      memcpy(dst + row_b, src, shift_b);
+      memcpy(dst + row_b + shift_b, src, row_b - shift_b);
+      src += vout_pitch_b;
+      dst += row_b * 2;
+   }
+
+   stereo_send_map(vout_width, vout_height);
+   video_cb(stereo_buf, vout_width * 2, vout_height, row_b * 2);
+   return true;
+}
+
 void retro_run(void)
 {
    //SysReset must be run while core is running,Not in menu (Locks up Retroarch)
@@ -3575,8 +3689,9 @@ void retro_run(void)
       pl_rearmed_cbs.fskip_dirty = 0;
    }
 
-   video_cb((vout_fb_dirty || !vout_can_dupe) ? vout_buf_ptr : NULL,
-       vout_width, vout_height, vout_pitch_b);
+   if (!stereo_present())
+      video_cb((vout_fb_dirty || !vout_can_dupe) ? vout_buf_ptr : NULL,
+          vout_width, vout_height, vout_pitch_b);
    vout_fb_dirty = 0;
 
 #ifdef HAVE_CDROM
@@ -3977,6 +4092,10 @@ void retro_init(void)
 
    vout_buf_ptr = vout_buf;
 
+   stereo_buf = malloc(vout_buf_size);
+   if (stereo_buf)
+      memset(stereo_buf, 0, vout_buf_size);
+
    loadPSXBios();
 
    environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &vout_can_dupe);
@@ -4019,6 +4138,9 @@ void retro_deinit(void)
    free(vout_buf);
 #endif
    vout_buf = NULL;
+   free(stereo_buf);
+   stereo_buf = NULL;
+   stereo_map_sent = false;
 
 #ifdef VITA
    deinit_vita_mmap();
