@@ -459,10 +459,11 @@ static inline void gpu_depth_snap(const le16_t *p, int w, int h)
 		memcpy(&gpu_depth_tmp[y * w], p + (y << 10), w * 2);
 }
 
-static inline void gpu_depth_diff(const le16_t *p, int w, int h)
+#define GPU_DEPTH_UI 65535   // sprites/tiles (HUD, text): drawn at screen depth
+
+static inline void gpu_depth_diff(const le16_t *p, int w, int h, u16 r)
 {
 	u16 *d = gpu_unai_depth + (p - gpu_unai.vram);
-	u16 r = gpu_depth_rank();
 	if (w * h > GPU_DEPTH_TMP_PIXELS) {      // too big to compare: tag all
 		for (int y = 0; y < h; y++)
 			for (int x = 0; x < w; x++)
@@ -488,11 +489,13 @@ static inline void gpu_depth_clear_rect(int x, int y, int w, int h)
 }
 
 // draw call wrappers: run the draw call, then tag changed pixels
-#define GPU_TAG_RECT(px, w, h, ...) do { \
+#define GPU_TAG_RECT_R(rank, px, w, h, ...) do { \
 	if (gpu_unai_depth_on && gpu_unai_depth) { \
 		const le16_t *_tp = (px); int _tw = (w), _th = (h); \
-		gpu_depth_snap(_tp, _tw, _th); __VA_ARGS__; gpu_depth_diff(_tp, _tw, _th); \
+		gpu_depth_snap(_tp, _tw, _th); __VA_ARGS__; gpu_depth_diff(_tp, _tw, _th, (rank)); \
 	} else { __VA_ARGS__; } } while (0)
+#define GPU_TAG_RECT(px, w, h, ...) GPU_TAG_RECT_R(gpu_depth_rank(), px, w, h, __VA_ARGS__)
+#define GPU_TAG_RECT_UI(px, w, h, ...) GPU_TAG_RECT_R(GPU_DEPTH_UI, px, w, h, __VA_ARGS__)
 #define GPU_TAG_SPAN(px, n, ...) GPU_TAG_RECT(px, n, 1, __VA_ARGS__)
 
 #endif // GPU_UNAI_H
