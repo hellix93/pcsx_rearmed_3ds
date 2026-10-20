@@ -1267,7 +1267,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
-   info->library_version  = "r26" GIT_VERSION " STEREO-v3";
+   info->library_version  = "r26" GIT_VERSION " STEREO-v4";
    info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
    info->need_fullpath    = true;
 }
@@ -3591,7 +3591,7 @@ static void stereo_clear_map(void)
 }
 
 /* Tells the user what the stereo code is doing; every message starts with
- * "STEREO v3" so it is obvious that this modified core is the one running. */
+ * "STEREO v4" so it is obvious that this modified core is the one running. */
 static void stereo_status(int code, const char *txt)
 {
    static int last = -1;
@@ -3610,17 +3610,18 @@ static void stereo_status(int code, const char *txt)
    const T *s_ = (const T *)src; \
    T *dl_ = (T *)dst; \
    T *dr_ = (T *)(dst + row_b); \
-   for (xo = 0; xo < w; xo++) { \
-      int half = 0, sl, sr; \
+   for (xo = 0; xo < we; xo++) { \
+      int sx = (xo * xstep) >> 16, half = 0, sl, sr; \
       if (drow) { \
-         int vx = xo - vout_img_x; \
+         int vx = sx - vout_img_x; \
          if ((unsigned)vx < (unsigned)vout_img_w) { \
             int norm = drow[(dx0 + vx) & 1023] * 256 / dn; \
             if (norm > 256) norm = 256; \
             half = ((norm - 128) * STEREO_STRENGTH_PX / 256) / 2; \
+            half = (half * shift_mul) >> 8; \
          } \
       } \
-      sl = xo - half; sr = xo + half; \
+      sl = sx - half; sr = sx + half; \
       if (sl < 0) sl = 0; else if (sl >= w) sl = w - 1; \
       if (sr < 0) sr = 0; else if (sr >= w) sr = w - 1; \
       dl_[xo] = s_[sl]; \
@@ -3632,29 +3633,37 @@ static bool stereo_present(void)
 {
 #ifdef _3DS
    int bytes_pp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
-   int w = vout_width, row_b, y, xo;
+   int w = vout_width, we, xstep, shift_mul, row_b, y, xo;
    const unsigned char *src = vout_buf_ptr;
    unsigned char *dst = stereo_buf;
    unsigned dn = gpu_unai_depth_disp_n ? gpu_unai_depth_disp_n : 1;
    int dx0 = gpu_unai_depth_disp_x;
 
    if (!stereo_wanted()) {
-      stereo_status(0, "STEREO v3: 3D off (set 3DS Display Mode = 3D, raise slider)");
+      stereo_status(0, "STEREO v4: 3D off (set 3DS Display Mode = 3D, raise slider)");
       stereo_clear_map();
       return false;
    }
    if (!stereo_buf || !src || !gpu_unai_depth) {
-      stereo_status(1, "STEREO v3: no depth buffer");
+      stereo_status(1, "STEREO v4: no depth buffer");
       stereo_clear_map();
       return false;
    }
-   if (!vout_img_ok || w <= 0 || vout_height <= 0 || w * 2 > VOUT_MAX_WIDTH) {
-      stereo_status(2, "STEREO v3: 3D unavailable in this video mode");
+   /* wide PS1 modes (e.g. 512 px) are squeezed to 320 px per eye so that
+    * both eyes fit into the 640 px wide frame the frontend accepts */
+   we = w > 320 ? 320 : w;
+   if (!vout_img_ok || w <= 0 || vout_height <= 0 || we * 2 > VOUT_MAX_WIDTH) {
+      static char msg[96];
+      snprintf(msg, sizeof(msg),
+         "STEREO v4: 3D unavailable (w=%d ok=%d)", w, vout_img_ok);
+      stereo_status(2, msg);
       stereo_clear_map();
       return false;
    }
+   xstep = (w << 16) / we;
+   shift_mul = (w << 8) / we;
 
-   row_b = w * bytes_pp;
+   row_b = we * bytes_pp;
    for (y = 0; y < vout_height; y++) {
       const unsigned short *drow = NULL;
       int iy = y - vout_img_y;
@@ -3673,9 +3682,9 @@ static bool stereo_present(void)
       dst += row_b * 2;
    }
 
-   stereo_send_map(w, vout_height);
-   stereo_status(3, "STEREO v3: 3D ON");
-   video_cb(stereo_buf, w * 2, vout_height, row_b * 2);
+   stereo_send_map(we, vout_height);
+   stereo_status(3, "STEREO v4: 3D ON");
+   video_cb(stereo_buf, we * 2, vout_height, row_b * 2);
    return true;
 #else
    stereo_clear_map();
