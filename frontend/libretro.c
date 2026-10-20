@@ -1267,7 +1267,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
-   info->library_version  = "r26" GIT_VERSION;
+   info->library_version  = "r26" GIT_VERSION " STEREO-v3";
    info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
    info->need_fullpath    = true;
 }
@@ -3590,6 +3590,17 @@ static void stereo_clear_map(void)
    SysPrintf("stereo3d: views map cleared\n");
 }
 
+/* Tells the user what the stereo code is doing; every message starts with
+ * "STEREO v3" so it is obvious that this modified core is the one running. */
+static void stereo_status(int code, const char *txt)
+{
+   static int last = -1;
+   if (code == last)
+      return;
+   last = code;
+   show_notification(txt, 5000, 2, RETRO_LOG_INFO);
+}
+
 /* Strength of the effect: total horizontal distance, in pixels of the
  * 320 px wide picture, between the left and right image of the farthest
  * and of the nearest object. Raise for a stronger 3D effect. */
@@ -3627,9 +3638,18 @@ static bool stereo_present(void)
    unsigned dn = gpu_unai_depth_disp_n ? gpu_unai_depth_disp_n : 1;
    int dx0 = gpu_unai_depth_disp_x;
 
-   if (!stereo_wanted() || !stereo_buf || !src || !gpu_unai_depth
-       || !vout_img_ok || w <= 0 || vout_height <= 0
-       || w * 2 > VOUT_MAX_WIDTH) {
+   if (!stereo_wanted()) {
+      stereo_status(0, "STEREO v3: 3D off (set 3DS Display Mode = 3D, raise slider)");
+      stereo_clear_map();
+      return false;
+   }
+   if (!stereo_buf || !src || !gpu_unai_depth) {
+      stereo_status(1, "STEREO v3: no depth buffer");
+      stereo_clear_map();
+      return false;
+   }
+   if (!vout_img_ok || w <= 0 || vout_height <= 0 || w * 2 > VOUT_MAX_WIDTH) {
+      stereo_status(2, "STEREO v3: 3D unavailable in this video mode");
       stereo_clear_map();
       return false;
    }
@@ -3654,6 +3674,7 @@ static bool stereo_present(void)
    }
 
    stereo_send_map(w, vout_height);
+   stereo_status(3, "STEREO v3: 3D ON");
    video_cb(stereo_buf, w * 2, vout_height, row_b * 2);
    return true;
 #else
