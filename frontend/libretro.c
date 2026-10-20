@@ -140,6 +140,15 @@ struct retro_video_views
 #endif
 static void *stereo_buf;
 static bool stereo_map_sent;
+/* where the displayed picture sits in vout_buf (filled by vout_flip) */
+static int vout_img_x, vout_img_y, vout_img_w, vout_img_h, vout_img_ok;
+#ifdef _3DS
+/* draw-order depth map kept by the Unai GPU plugin (plugins/gpu_unai) */
+extern unsigned short *gpu_unai_depth;
+extern int gpu_unai_depth_on;
+extern int gpu_unai_depth_disp_x, gpu_unai_depth_disp_y;
+extern unsigned gpu_unai_depth_disp_n;
+#endif
 static void *vout_buf;
 static void *vout_buf_ptr;
 static int vout_width = 256, vout_height = 240, vout_pitch_b = 256*2;
@@ -457,6 +466,11 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
    int w_blit = min(w, vout_width);
    int port = 0, hwrapped;
    int sstride = 2048;
+
+   vout_img_x = x; vout_img_y = y; vout_img_w = w;
+   vout_img_h = min(h, vout_height);
+   vout_img_ok = vram != NULL && !bgr24 && !enhres && w <= vout_width
+      && h < vout_height * 3 / 2;
 
    if (vram == NULL || dims_changed || (in_enable_crosshair[0] + in_enable_crosshair[1]) > 0)
    {
@@ -3529,12 +3543,10 @@ static void print_internal_fps(void)
 static bool get_bios_config_hle(void);
 static void prepare_bios(bool use_hle);
 
-#define STEREO_TEST_SHIFT 4 /* pixels, stage 1 only */
-
 /* ---- stereo3d section ----
  * Packs the finished frame as [left eye | right eye] side by side and tells
- * the frontend where each eye is. Stage 1: both eyes are identical (flat
- * image shown through the stereo path) to verify the output chain. */
+ * the frontend where each eye is. Each eye is shifted by per-pixel depth
+ * (draw order rank from the Unai GPU plugin). */
 static bool stereo_wanted(void)
 {
    unsigned status = 0;
@@ -3578,43 +3590,83 @@ static void stereo_clear_map(void)
    SysPrintf("stereo3d: views map cleared\n");
 }
 
+/* Strength of the effect: total horizontal distance, in pixels of the
+ * 320 px wide picture, between the left and right image of the farthest
+ * and of the nearest object. Raise for a stronger 3D effect. */
+#define STEREO_STRENGTH_PX 16
+
+#define STEREO_BUILD_ROWS(T) do { \
+   const T *s_ = (const T *)src; \
+   T *dl_ = (T *)dst; \
+   T *dr_ = (T *)(dst + row_b); \
+   for (xo = 0; xo < w; xo++) { \
+      int half = 0, sl, sr; \
+      if (drow) { \
+         int vx = xo - vout_img_x; \
+         if ((unsigned)vx < (unsigned)vout_img_w) { \
+            int norm = drow[(dx0 + vx) & 1023] * 256 / dn; \
+            if (norm > 256) norm = 256; \
+            half = ((norm - 128) * STEREO_STRENGTH_PX / 256) / 2; \
+         } \
+      } \
+      sl = xo - half; sr = xo + half; \
+      if (sl < 0) sl = 0; else if (sl >= w) sl = w - 1; \
+      if (sr < 0) sr = 0; else if (sr >= w) sr = w - 1; \
+      dl_[xo] = s_[sl]; \
+      dr_[xo] = s_[sr]; \
+   } } while (0)
+
 /* returns true if the packed frame was sent */
 static bool stereo_present(void)
 {
+#ifdef _3DS
    int bytes_pp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
-   int row_b, shift_b, y;
+   int w = vout_width, row_b, y, xo;
    const unsigned char *src = vout_buf_ptr;
    unsigned char *dst = stereo_buf;
+   unsigned dn = gpu_unai_depth_disp_n ? gpu_unai_depth_disp_n : 1;
+   int dx0 = gpu_unai_depth_disp_x;
 
-   if (!stereo_wanted() || !stereo_buf || !src
-       || vout_width <= 0 || vout_height <= 0
-       || vout_width * 2 > VOUT_MAX_WIDTH) {
+   if (!stereo_wanted() || !stereo_buf || !src || !gpu_unai_depth
+       || !vout_img_ok || w <= 0 || vout_height <= 0
+       || w * 2 > VOUT_MAX_WIDTH) {
       stereo_clear_map();
       return false;
    }
 
-   row_b = vout_width * bytes_pp;
-   shift_b = STEREO_TEST_SHIFT * bytes_pp;
-   if (shift_b >= row_b)
-      shift_b = 0;
+   row_b = w * bytes_pp;
    for (y = 0; y < vout_height; y++) {
-      /* left eye: the frame as is */
-      memcpy(dst, src, row_b);
-      /* right eye (stage 1 test): same frame moved right by a constant,
-       * so the whole picture floats at one fixed depth behind the screen */
-      memcpy(dst + row_b, src, shift_b);
-      memcpy(dst + row_b + shift_b, src, row_b - shift_b);
+      const unsigned short *drow = NULL;
+      int iy = y - vout_img_y;
+
+      if (iy >= 0 && iy < vout_img_h)
+         drow = gpu_unai_depth + (((gpu_unai_depth_disp_y + iy) & 511) << 10);
+
+      /* each eye is the picture shifted sideways by its pixels' depth:
+       * near things move right in the left eye and left in the right eye */
+      if (bytes_pp == 4)
+         STEREO_BUILD_ROWS(unsigned int);
+      else
+         STEREO_BUILD_ROWS(unsigned short);
+
       src += vout_pitch_b;
       dst += row_b * 2;
    }
 
-   stereo_send_map(vout_width, vout_height);
-   video_cb(stereo_buf, vout_width * 2, vout_height, row_b * 2);
+   stereo_send_map(w, vout_height);
+   video_cb(stereo_buf, w * 2, vout_height, row_b * 2);
    return true;
+#else
+   stereo_clear_map();
+   return false;
+#endif
 }
 
 void retro_run(void)
 {
+#ifdef _3DS
+   gpu_unai_depth_on = stereo_wanted();
+#endif
    //SysReset must be run while core is running,Not in menu (Locks up Retroarch)
    if (reset_pending)
    {
