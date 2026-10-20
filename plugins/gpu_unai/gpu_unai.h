@@ -423,4 +423,76 @@ static inline bool ProgressiveInterlaceEnabled()
 #endif
 }
 
+
+// ---------------------------------------------------------------------
+// Stereo 3D mod: per-pixel "draw order rank" map used by the frontend to
+// build left/right eye images. A primitive's rank = its index among the
+// primitives drawn since the display area last changed (later = closer).
+// Only pixels that a primitive really changed get its rank, so transparent
+// texels do not receive a wrong depth.
+// ---------------------------------------------------------------------
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern unsigned short *gpu_unai_depth;      // 1024x512, one entry per VRAM pixel
+extern int gpu_unai_depth_on;               // set by frontend when stereo is active
+extern unsigned gpu_unai_depth_cur;         // rank of the primitive being drawn
+extern int gpu_unai_depth_disp_x;           // displayed area origin in VRAM
+extern int gpu_unai_depth_disp_y;
+extern unsigned gpu_unai_depth_disp_n;      // number of primitives in displayed frame
+#ifdef __cplusplus
+}
+#endif
+
+#define GPU_DEPTH_TMP_PIXELS (256 * 256)
+extern u16 gpu_depth_tmp[GPU_DEPTH_TMP_PIXELS];
+
+static inline u16 gpu_depth_rank(void)
+{
+	return gpu_unai_depth_cur > 65535u ? 65535u : (u16)gpu_unai_depth_cur;
+}
+
+static inline void gpu_depth_snap(const le16_t *p, int w, int h)
+{
+	if (w * h > GPU_DEPTH_TMP_PIXELS) return;
+	for (int y = 0; y < h; y++)
+		memcpy(&gpu_depth_tmp[y * w], p + (y << 10), w * 2);
+}
+
+static inline void gpu_depth_diff(const le16_t *p, int w, int h)
+{
+	u16 *d = gpu_unai_depth + (p - gpu_unai.vram);
+	u16 r = gpu_depth_rank();
+	if (w * h > GPU_DEPTH_TMP_PIXELS) {      // too big to compare: tag all
+		for (int y = 0; y < h; y++)
+			for (int x = 0; x < w; x++)
+				d[(y << 10) + x] = r;
+		return;
+	}
+	for (int y = 0; y < h; y++) {
+		const u16 *row = (const u16 *)(p + (y << 10));   // raw compare, le16_t is a struct
+		const u16 *old = &gpu_depth_tmp[y * w];
+		u16 *drow = d + (y << 10);
+		for (int x = 0; x < w; x++)
+			if (row[x] != old[x]) drow[x] = r;
+	}
+}
+
+static inline void gpu_depth_clear_rect(int x, int y, int w, int h)
+{
+	if (!gpu_unai_depth) return;
+	if (x < 0) x = 0;
+	if (w > 1024 - x) w = 1024 - x;
+	for (int i = 0; i < h; i++)
+		memset(gpu_unai_depth + (((y + i) & 511) << 10) + x, 0, w * 2);
+}
+
+// draw call wrappers: run the draw call, then tag changed pixels
+#define GPU_TAG_RECT(px, w, h, ...) do { \
+	if (gpu_unai_depth_on && gpu_unai_depth) { \
+		const le16_t *_tp = (px); int _tw = (w), _th = (h); \
+		gpu_depth_snap(_tp, _tw, _th); __VA_ARGS__; gpu_depth_diff(_tp, _tw, _th); \
+	} else { __VA_ARGS__; } } while (0)
+#define GPU_TAG_SPAN(px, n, ...) GPU_TAG_RECT(px, n, 1, __VA_ARGS__)
+
 #endif // GPU_UNAI_H

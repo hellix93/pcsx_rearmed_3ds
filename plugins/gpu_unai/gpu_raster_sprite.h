@@ -73,7 +73,7 @@ void gpuDrawS(PtrUnion packet, const PS gpuSpriteDriver, s32 *w_out, s32 *h_out)
 	gpu_unai.inn.v = v0;
 	gpu_unai.inn.y0 = y0;
 	gpu_unai.inn.y1 = y1;
-	gpuSpriteDriver(Pixel, x1, (u8 *)gpu_unai.inn.TBA, gpu_unai.inn);
+	GPU_TAG_RECT(Pixel, x1, (y1 - y0), gpuSpriteDriver(Pixel, x1, (u8 *)gpu_unai.inn.TBA, gpu_unai.inn));
 }
 
 void gpuDrawT(PtrUnion packet, const PT gpuTileDriver, s32 *w_out, s32 *h_out)
@@ -109,7 +109,7 @@ void gpuDrawT(PtrUnion packet, const PT gpuTileDriver, s32 *w_out, s32 *h_out)
 
 	gpu_unai.inn.y0 = y0;
 	gpu_unai.inn.y1 = y1;
-	gpuTileDriver(Pixel, Data, x1, gpu_unai.inn);
+	GPU_TAG_RECT(Pixel, x1, (y1 - y0), gpuTileDriver(Pixel, Data, x1, gpu_unai.inn));
 }
 
 #endif /* __GPU_UNAI_GPU_RASTER_SPRITE_H__ */

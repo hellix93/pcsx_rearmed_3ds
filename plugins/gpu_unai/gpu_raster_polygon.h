@@ -371,7 +371,7 @@ void gpuDrawPolyF(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_quad
 				if ((xmin - xa) > 0) xa = xmin;
 				if (xb > xmax) xb = xmax;
 				if ((xb - xa) > 0)
-					gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya);
+					GPU_TAG_SPAN(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
 			}
 		}
 	} while (++cur_pass < total_passes);
@@ -702,7 +702,7 @@ void gpuDrawPolyFT(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_qua
 
 				if (xb > xmax) xb = xmax;
 				if ((xb - xa) > 0)
-					gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya);
+					GPU_TAG_SPAN(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
 			}
 		}
 	} while (++cur_pass < total_passes);
@@ -1051,7 +1051,7 @@ void gpuDrawPolyG(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_quad
 
 				if (xb > xmax) xb = xmax;
 				if ((xb - xa) > 0)
-					gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya);
+					GPU_TAG_SPAN(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
 			}
 		}
 	} while (++cur_pass < total_passes);
@@ -1458,7 +1458,7 @@ void gpuDrawPolyGT(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_qua
 
 				if (xb > xmax) xb = xmax;
 				if ((xb - xa) > 0)
-					gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya);
+					GPU_TAG_SPAN(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
 			}
 		}
 	} while (++cur_pass < total_passes);

@@ -60,8 +60,18 @@
 #define IS_OLD_RENDERER() false
 #endif
 
+unsigned short *gpu_unai_depth;
+int gpu_unai_depth_on;
+unsigned gpu_unai_depth_cur = 1;
+int gpu_unai_depth_disp_x, gpu_unai_depth_disp_y;
+unsigned gpu_unai_depth_disp_n = 1;
+u16 gpu_depth_tmp[GPU_DEPTH_TMP_PIXELS];
+
 int renderer_init(void)
 {
+  if (!gpu_unai_depth)
+    gpu_unai_depth = (unsigned short *)calloc(1024 * 512, sizeof(unsigned short));
+  gpu_unai_depth_cur = 1;
   memset((void*)&gpu_unai, 0, sizeof(gpu_unai));
   gpu_unai.vram = (le16_t *)gpu.vram;
 
@@ -107,10 +117,27 @@ int renderer_init(void)
 
 void renderer_finish(void)
 {
+  free(gpu_unai_depth);
+  gpu_unai_depth = NULL;
 }
 
 void renderer_notify_screen_change(const struct psx_gpu_screen *screen)
 {
+  if (gpu_unai_depth_on && gpu_unai_depth
+      && (screen->src_x != gpu_unai_depth_disp_x
+          || screen->src_y != gpu_unai_depth_disp_y))
+  {
+    // frame just finished is now displayed: remember how many primitives it had
+    gpu_unai_depth_disp_n = gpu_unai_depth_cur > 1 ? gpu_unai_depth_cur - 1 : 1;
+    // the previously displayed buffer is where the next frame is drawn
+    gpu_depth_clear_rect(gpu_unai_depth_disp_x, gpu_unai_depth_disp_y,
+        screen->hres > 0 ? screen->hres : 320,
+        screen->vres > 0 ? screen->vres : 240);
+    gpu_unai_depth_disp_x = screen->src_x;
+    gpu_unai_depth_disp_y = screen->src_y;
+    gpu_unai_depth_cur = 1;
+  }
+
   gpu_unai.inn.ilace_mask = gpu_unai.config.ilace_force;
 
   if (gpu.state.downscale_enable)
@@ -251,6 +278,9 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       cmd = -1;
       break;
     }
+
+    if (gpu_unai_depth_on && gpu_unai_depth_cur < 65535u)
+      gpu_unai_depth_cur++;
 
     #define PRIM cmd
     gpu_unai.PacketBuffer.U4[0] = list[0];
