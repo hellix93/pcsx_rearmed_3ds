@@ -140,7 +140,15 @@ struct retro_video_views
 };
 #endif
 static void *stereo_buf;
-static int stereo_dzl[640], stereo_dzr[640]; /* per-row depth of each eye pixel */
+/* per-row work arrays of the stereo builder (see STEREO_BUILD_ROWS) */
+static int stereo_z[640];                 /* raw depth rank of each source pixel */
+static int stereo_h[640];                 /* sideways shift, 1/8 px */
+static int stereo_cs[641];                /* running sum for the box blur */
+static int stereo_hprev[640];             /* smoothed shift of the row above */
+static int stereo_zl[640], stereo_zr[640];/* depth of what is written to each eye */
+static unsigned char stereo_ui[640], stereo_fl[640], stereo_fr[640];
+/* 65536 / n for window sizes n = 1..9 of the box blur */
+static const int stereo_rcp9[10] = { 0, 65536, 32768, 21845, 16384, 13107, 10923, 9362, 8192, 7282 };
 static bool stereo_map_sent;
 /* where the displayed picture sits in vout_buf (filled by vout_flip) */
 static int vout_img_x, vout_img_y, vout_img_w, vout_img_h, vout_img_ok;
@@ -1269,7 +1277,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
-   info->library_version  = "r26" GIT_VERSION " STEREO-v5";
+   info->library_version  = "r26" GIT_VERSION " STEREO-v6";
    info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
    info->need_fullpath    = true;
 }
@@ -3593,7 +3601,7 @@ static void stereo_clear_map(void)
 }
 
 /* Tells the user what the stereo code is doing; every message starts with
- * "STEREO v5" so it is obvious that this modified core is the one running. */
+ * "STEREO v6" so it is obvious that this modified core is the one running. */
 static void stereo_status(int code, const char *txt)
 {
    static int last = -1;
@@ -3606,38 +3614,63 @@ static void stereo_status(int code, const char *txt)
 /* Strength of the effect: total horizontal distance, in pixels of the
  * 320 px wide picture, between the left and right image of the farthest
  * and of the nearest object. Raise for a stronger 3D effect. */
-#define STEREO_STRENGTH_PX 16
+#define STEREO_STRENGTH_PX 12
 
-/* Builds both eyes of one row. Every source pixel is moved sideways by its
- * depth (forward warp); where two pixels land on the same spot the nearer
- * one wins, and gaps are filled from the farther (background) side. */
+/* Builds both eyes of one row in three steps:
+ * 1. depth rank of every pixel -> sideways shift (HUD pixels get 0);
+ * 2. the shifts are smoothed (box blur along the row, blend with the row
+ *    above) so that neighbouring polygons with slightly different ranks do
+ *    not tear apart;
+ * 3. forward warp: every pixel moves by its shift, the nearer pixel wins and
+ *    gaps are filled from the background side.
+ * Shifts are kept in 1/8 pixel units until the very end. */
 #define STEREO_BUILD_ROWS(T) do { \
    const T *s_ = (const T *)src; \
    T *dl_ = (T *)dst; \
    T *dr_ = (T *)(dst + row_b); \
-   for (xo = 0; xo < we; xo++) { stereo_dzl[xo] = -1; stereo_dzr[xo] = -1; } \
+   stereo_cs[0] = 0; \
    for (xo = 0; xo < we; xo++) { \
-      int sx_ = (xo * xstep) >> 16, half_ = 0, dz_ = 0, xl_, xr_; \
-      T pix_ = s_[sx_]; \
+      int sx_ = (xo * xstep) >> 16, h_ = 0, ui_ = 0, dz_ = 0; \
       if (drow) { \
          int vx_ = sx_ - vout_img_x; \
          if ((unsigned)vx_ < (unsigned)vout_img_w) { \
             dz_ = drow[(dx0 + vx_) & 1023]; \
-            if (dz_ != 65535) { /* 65535 = HUD/text: no shift */ \
+            if (dz_ == 65535) ui_ = 1; \
+            else { \
                int d_ = dz_ > (int)dn ? (int)dn : dz_; \
-               int n_ = ((d_ * rcp) >> 16) & ~15; /* 16 depth levels */ \
-               half_ = ((n_ - 128) * strength) >> 9; \
+               int n_ = (d_ * rcp) >> 16; \
+               h_ = ((n_ - 128) * strength * 8) >> 9; \
             } \
          } \
       } \
+      stereo_z[xo] = dz_; stereo_h[xo] = h_; stereo_ui[xo] = ui_; \
+      stereo_cs[xo + 1] = stereo_cs[xo] + h_; \
+      stereo_zl[xo] = -1; stereo_zr[xo] = -1; \
+      stereo_fl[xo] = 0; stereo_fr[xo] = 0; \
+   } \
+   for (xo = 0; xo < we; xo++) { \
+      int lo_ = xo - 4 < 0 ? 0 : xo - 4, hi_ = xo + 5 > we ? we : xo + 5; \
+      int hs_ = ((stereo_cs[hi_] - stereo_cs[lo_]) * stereo_rcp9[hi_ - lo_]) >> 16; \
+      int hf_ = 0; \
+      if (!stereo_ui[xo]) { \
+         hf_ = first_row ? hs_ : (hs_ + 3 * stereo_hprev[xo]) >> 2; \
+         stereo_hprev[xo] = hf_; \
+      } \
+      stereo_h[xo] = hf_; \
+   } \
+   first_row = 0; \
+   for (xo = 0; xo < we; xo++) { \
+      int sx_ = (xo * xstep) >> 16, dz_ = stereo_z[xo], hh_ = stereo_h[xo], half_, xl_, xr_; \
+      T pix_ = s_[sx_]; \
+      half_ = hh_ >= 0 ? (hh_ + 4) >> 3 : -((-hh_ + 4) >> 3); \
       xl_ = xo + half_; xr_ = xo - half_; \
-      if ((unsigned)xl_ < (unsigned)we && dz_ >= stereo_dzl[xl_]) { dl_[xl_] = pix_; stereo_dzl[xl_] = dz_; } \
-      if ((unsigned)xr_ < (unsigned)we && dz_ >= stereo_dzr[xr_]) { dr_[xr_] = pix_; stereo_dzr[xr_] = dz_; } \
+      if ((unsigned)xl_ < (unsigned)we && dz_ >= stereo_zl[xl_]) { dl_[xl_] = pix_; stereo_zl[xl_] = dz_; stereo_fl[xl_] = 1; } \
+      if ((unsigned)xr_ < (unsigned)we && dz_ >= stereo_zr[xr_]) { dr_[xr_] = pix_; stereo_zr[xr_] = dz_; stereo_fr[xr_] = 1; } \
    } \
    for (xo = 0; xo < we; xo++) \
-      if (stereo_dzl[xo] < 0) dl_[xo] = xo ? dl_[xo - 1] : s_[0]; \
+      if (!stereo_fl[xo]) dl_[xo] = xo ? dl_[xo - 1] : s_[0]; \
    for (xo = we - 1; xo >= 0; xo--) \
-      if (stereo_dzr[xo] < 0) dr_[xo] = (xo < we - 1) ? dr_[xo + 1] : s_[w - 1]; \
+      if (!stereo_fr[xo]) dr_[xo] = (xo < we - 1) ? dr_[xo + 1] : s_[w - 1]; \
 } while (0)
 
 /* returns true if the packed frame was sent */
@@ -3645,19 +3678,19 @@ static bool stereo_present(void)
 {
 #ifdef _3DS
    int bytes_pp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
-   int w = vout_width, we, xstep, rcp, strength, row_b, y, xo;
+   int w = vout_width, we, xstep, rcp, strength, row_b, y, xo, first_row = 1;
    const unsigned char *src = vout_buf_ptr;
    unsigned char *dst = stereo_buf;
    unsigned dn = gpu_unai_depth_disp_n ? gpu_unai_depth_disp_n : 1;
    int dx0 = gpu_unai_depth_disp_x;
 
    if (!stereo_wanted()) {
-      stereo_status(0, "STEREO v5: 3D off (set 3DS Display Mode = 3D, raise slider)");
+      stereo_status(0, "STEREO v6: 3D off (set 3DS Display Mode = 3D, raise slider)");
       stereo_clear_map();
       return false;
    }
    if (!stereo_buf || !src || !gpu_unai_depth) {
-      stereo_status(1, "STEREO v5: no depth buffer");
+      stereo_status(1, "STEREO v6: no depth buffer");
       stereo_clear_map();
       return false;
    }
@@ -3667,12 +3700,19 @@ static bool stereo_present(void)
    if (!vout_img_ok || w <= 0 || vout_height <= 0 || we * 2 > VOUT_MAX_WIDTH) {
       static char msg[96];
       snprintf(msg, sizeof(msg),
-         "STEREO v5: 3D unavailable (w=%d ok=%d)", w, vout_img_ok);
+         "STEREO v6: 3D unavailable (w=%d ok=%d)", w, vout_img_ok);
       stereo_status(2, msg);
       stereo_clear_map();
       return false;
    }
    xstep = (w << 16) / we;
+   /* the primitive count changes from frame to frame; low-pass it so that
+    * static scenery does not "breathe" in depth */
+   {
+      static unsigned dn_smooth;
+      dn_smooth = dn_smooth ? (dn_smooth * 7 + dn) / 8 : dn;
+      dn = dn_smooth ? dn_smooth : 1;
+   }
    rcp = (256 << 16) / (int)dn;   /* one division per frame, not per pixel */
    /* depth strength follows the 3DS slider like in native games */
    strength = (int)(STEREO_STRENGTH_PX * osGet3DSliderState() + 0.5f);
@@ -3698,7 +3738,7 @@ static bool stereo_present(void)
    }
 
    stereo_send_map(we, vout_height);
-   stereo_status(3, "STEREO v5: 3D ON");
+   stereo_status(3, "STEREO v6: 3D ON");
    video_cb(stereo_buf, we * 2, vout_height, row_b * 2);
    return true;
 #else
