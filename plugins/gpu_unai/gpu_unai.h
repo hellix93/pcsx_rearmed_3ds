@@ -440,9 +440,27 @@ extern unsigned gpu_unai_depth_cur;         // rank of the primitive being drawn
 extern int gpu_unai_depth_disp_x;           // displayed area origin in VRAM
 extern int gpu_unai_depth_disp_y;
 extern unsigned gpu_unai_depth_disp_n;      // number of primitives in displayed frame
+// Real vertex depth taken from the GTE (hooked in the dynarec): see gpulib_if.cpp
+void gpu_unai_depth_record_rtps(const unsigned int *cp2d);
+void gpu_unai_depth_record_rtpt(const unsigned int *cp2d);
+extern unsigned gpu_unai_zrec;              // vertices recorded from the GTE
+extern unsigned gpu_unai_zhit;              // polygon vertices whose depth was found
+extern unsigned gpu_unai_zmiss;             // polygon vertices without depth
 #ifdef __cplusplus
 }
 #endif
+
+// Depth value stored per pixel: v = 65534 * 64 / z (so larger = nearer, linear
+// in screen space); 0 = untouched, 65535 = 2D/HUD.
+struct gpu_dplane_t {
+	s32 v0_8, dvdx_8, dvdy_8;   // value at (xr,yr) and slopes, 24.8 fixed point
+	s32 xr, yr;
+	bool ui;                    // polygon without GTE depth: 2D element
+};
+extern gpu_dplane_t gpu_dplane;
+extern unsigned gpu_depth_lastv;
+int gpu_depth_lookup(u32 key);
+void gpu_depth_set_plane(int v0, int x0, int y0, int v1, int x1, int y1, int v2, int x2, int y2);
 
 #define GPU_DEPTH_TMP_PIXELS (256 * 256)
 extern u16 gpu_depth_tmp[GPU_DEPTH_TMP_PIXELS];
@@ -487,6 +505,34 @@ static inline void gpu_depth_clear_rect(int x, int y, int w, int h)
 	for (int i = 0; i < h; i++)
 		memset(gpu_unai_depth + (((y + i) & 511) << 10) + x, 0, w * 2);
 }
+
+// tag changed pixels with the depth of the current polygon plane
+static inline void gpu_depth_diff_plane(const le16_t *p, int w)
+{
+	u16 *d = gpu_unai_depth + (p - gpu_unai.vram);
+	const u16 *row = (const u16 *)p;
+	const u16 *old = gpu_depth_tmp;
+	if (gpu_dplane.ui) {
+		for (int x = 0; x < w; x++)
+			if (row[x] != old[x]) d[x] = GPU_DEPTH_UI;
+		return;
+	}
+	int idx = p - gpu_unai.vram;
+	s32 v8 = gpu_dplane.v0_8 + gpu_dplane.dvdx_8 * ((idx & 1023) - gpu_dplane.xr)
+	       + gpu_dplane.dvdy_8 * ((idx >> 10) - gpu_dplane.yr);
+	for (int x = 0; x < w; x++, v8 += gpu_dplane.dvdx_8) {
+		if (row[x] != old[x]) {
+			s32 v = v8 >> 8;
+			d[x] = v < 1 ? 1 : (v > 65534 ? 65534 : (u16)v);
+		}
+	}
+}
+
+#define GPU_TAG_SPAN_Z(px, n, ...) do { \
+	if (gpu_unai_depth_on && gpu_unai_depth) { \
+		const le16_t *_tp = (px); int _tw = (n); \
+		gpu_depth_snap(_tp, _tw, 1); __VA_ARGS__; gpu_depth_diff_plane(_tp, _tw); \
+	} else { __VA_ARGS__; } } while (0)
 
 // draw call wrappers: run the draw call, then tag changed pixels
 #define GPU_TAG_RECT_R(rank, px, w, h, ...) do { \

@@ -30,6 +30,7 @@
 
 struct PolyVertex {
 	s32 x, y; // Sign-extended 11-bit X,Y coords
+	s32 v;    // stereo mod: depth from the GTE cache (-1 = unknown)
 	union {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 		struct { u8 pad[2], v, u; } tex; // Texture coords (if used)
@@ -84,6 +85,7 @@ static void polyInitVertexBuffer(PolyVertex *vbuf, const PtrUnion packet, PolyTy
 		u32 coords = le32_to_u32(*ptr);
 		vbuf[i].x = GPU_EXPANDSIGN(coords);
 		vbuf[i].y = GPU_EXPANDSIGN(coords >> 16);
+		vbuf[i].v = (gpu_unai_depth_on && gpu_unai_depth) ? gpu_depth_lookup(coords) : -1;
 	}
 
 	// U,V texture coords (if applicable)
@@ -252,6 +254,8 @@ void gpuDrawPolyF(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_quad
 		x0 = vptrs[0]->x + x_off;  y0 = vptrs[0]->y + y_off;
 		x1 = vptrs[1]->x + x_off;  y1 = vptrs[1]->y + y_off;
 		x2 = vptrs[2]->x + x_off;  y2 = vptrs[2]->y + y_off;
+		if (gpu_unai_depth_on && gpu_unai_depth)
+			gpu_depth_set_plane(vptrs[0]->v, x0, y0, vptrs[1]->v, x1, y1, vptrs[2]->v, x2, y2);
 
 		ya = y2 - y0;
 		yb = y2 - y1;
@@ -371,7 +375,7 @@ void gpuDrawPolyF(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_quad
 				if ((xmin - xa) > 0) xa = xmin;
 				if (xb > xmax) xb = xmax;
 				if ((xb - xa) > 0)
-					GPU_TAG_SPAN(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
+					GPU_TAG_SPAN_Z(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
 			}
 		}
 	} while (++cur_pass < total_passes);
@@ -412,6 +416,8 @@ void gpuDrawPolyFT(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_qua
 		x1 = vptrs[1]->x + x_off; y1 = vptrs[1]->y + y_off;
 		u1 = vptrs[1]->tex.u;     v1 = vptrs[1]->tex.v;
 		x2 = vptrs[2]->x + x_off; y2 = vptrs[2]->y + y_off;
+		if (gpu_unai_depth_on && gpu_unai_depth)
+			gpu_depth_set_plane(vptrs[0]->v, x0, y0, vptrs[1]->v, x1, y1, vptrs[2]->v, x2, y2);
 		u2 = vptrs[2]->tex.u;     v2 = vptrs[2]->tex.v;
 
 		ya = y2 - y0;
@@ -702,7 +708,7 @@ void gpuDrawPolyFT(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_qua
 
 				if (xb > xmax) xb = xmax;
 				if ((xb - xa) > 0)
-					GPU_TAG_SPAN(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
+					GPU_TAG_SPAN_Z(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
 			}
 		}
 	} while (++cur_pass < total_passes);
@@ -737,6 +743,8 @@ void gpuDrawPolyG(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_quad
 		x1 = vptrs[1]->x + x_off; y1 = vptrs[1]->y + y_off;
 		r1 = vptrs[1]->col.r;     g1 = vptrs[1]->col.g;  b1 = vptrs[1]->col.b;
 		x2 = vptrs[2]->x + x_off; y2 = vptrs[2]->y + y_off;
+		if (gpu_unai_depth_on && gpu_unai_depth)
+			gpu_depth_set_plane(vptrs[0]->v, x0, y0, vptrs[1]->v, x1, y1, vptrs[2]->v, x2, y2);
 		r2 = vptrs[2]->col.r;     g2 = vptrs[2]->col.g;  b2 = vptrs[2]->col.b;
 
 		ya = y2 - y0;
@@ -1051,7 +1059,7 @@ void gpuDrawPolyG(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_quad
 
 				if (xb > xmax) xb = xmax;
 				if ((xb - xa) > 0)
-					GPU_TAG_SPAN(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
+					GPU_TAG_SPAN_Z(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
 			}
 		}
 	} while (++cur_pass < total_passes);
@@ -1091,6 +1099,8 @@ void gpuDrawPolyGT(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_qua
 		u1 = vptrs[1]->tex.u;     v1 = vptrs[1]->tex.v;
 		r1 = vptrs[1]->col.r;     g1 = vptrs[1]->col.g;  b1 = vptrs[1]->col.b;
 		x2 = vptrs[2]->x + x_off; y2 = vptrs[2]->y + y_off;
+		if (gpu_unai_depth_on && gpu_unai_depth)
+			gpu_depth_set_plane(vptrs[0]->v, x0, y0, vptrs[1]->v, x1, y1, vptrs[2]->v, x2, y2);
 		u2 = vptrs[2]->tex.u;     v2 = vptrs[2]->tex.v;
 		r2 = vptrs[2]->col.r;     g2 = vptrs[2]->col.g;  b2 = vptrs[2]->col.b;
 
@@ -1458,7 +1468,7 @@ void gpuDrawPolyGT(const PtrUnion packet, const PP gpuPolySpanDriver, u32 is_qua
 
 				if (xb > xmax) xb = xmax;
 				if ((xb - xa) > 0)
-					GPU_TAG_SPAN(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
+					GPU_TAG_SPAN_Z(PixelBase + xa, (xb - xa), gpuPolySpanDriver(gpu_unai, PixelBase + xa, (xb - xa), ya));
 			}
 		}
 	} while (++cur_pass < total_passes);

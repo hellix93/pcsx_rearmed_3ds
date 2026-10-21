@@ -66,6 +66,82 @@ unsigned gpu_unai_depth_cur = 1;
 int gpu_unai_depth_disp_x, gpu_unai_depth_disp_y;
 unsigned gpu_unai_depth_disp_n = 1;
 u16 gpu_depth_tmp[GPU_DEPTH_TMP_PIXELS];
+gpu_dplane_t gpu_dplane;
+unsigned gpu_depth_lastv;
+unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
+
+// Cache "screen position of a vertex -> its depth", filled from the GTE
+// (RTPS/RTPT results) and read when the polygon packet arrives.
+#define ZCACHE_BITS 14
+struct zcache_ent { u32 key; u32 v; };
+static zcache_ent zcache[1 << ZCACHE_BITS];
+static inline u32 zcache_idx(u32 key) { return (key * 2654435761u) >> (32 - ZCACHE_BITS); }
+
+static inline void zcache_put(u32 sxy, u32 sz)
+{
+  u32 v = sz ? (65534u * 64u) / sz : 65534u;     // nearer -> larger
+  if (v > 65534u) v = 65534u;
+  if (v < 1u) v = 1u;
+  zcache_ent *e = &zcache[zcache_idx(sxy)];
+  e->key = sxy;
+  e->v = v;
+  gpu_unai_zrec++;
+}
+
+extern "C" void gpu_unai_depth_record_rtps(const unsigned int *cp2d)
+{
+  if (!gpu_unai_depth_on) return;
+  zcache_put(cp2d[14], cp2d[19] & 0xffff);
+}
+
+extern "C" void gpu_unai_depth_record_rtpt(const unsigned int *cp2d)
+{
+  if (!gpu_unai_depth_on) return;
+  zcache_put(cp2d[12], cp2d[17] & 0xffff);
+  zcache_put(cp2d[13], cp2d[18] & 0xffff);
+  zcache_put(cp2d[14], cp2d[19] & 0xffff);
+}
+
+int gpu_depth_lookup(u32 key)
+{
+  const zcache_ent *e = &zcache[zcache_idx(key)];
+  if (e->key == key && e->v) { gpu_unai_zhit++; return (int)e->v; }
+  gpu_unai_zmiss++;
+  return -1;
+}
+
+void gpu_depth_set_plane(int v0, int x0, int y0, int v1, int x1, int y1, int v2, int x2, int y2)
+{
+  int known = 0, sum = 0;
+  if (v0 >= 0) { sum += v0; known++; }
+  if (v1 >= 0) { sum += v1; known++; }
+  if (v2 >= 0) { sum += v2; known++; }
+  if (!known) {                       // no GTE depth at all: 2D element (HUD, text)
+    gpu_dplane.ui = true;
+    return;
+  }
+  int avg = sum / known;
+  gpu_dplane.ui = false;
+  gpu_depth_lastv = avg;
+  if (v0 < 0) v0 = avg;
+  if (v1 < 0) v1 = avg;
+  if (v2 < 0) v2 = avg;
+
+  gpu_dplane.xr = x0; gpu_dplane.yr = y0;
+  gpu_dplane.v0_8 = v0 << 8;
+  float a = (float)((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0));
+  if (a > -1.0f && a < 1.0f) {        // degenerate: constant depth
+    gpu_dplane.v0_8 = avg << 8;
+    gpu_dplane.dvdx_8 = gpu_dplane.dvdy_8 = 0;
+    return;
+  }
+  float dvdx = ((float)(v1 - v0) * (y2 - y0) - (float)(v2 - v0) * (y1 - y0)) / a;
+  float dvdy = ((float)(x1 - x0) * (v2 - v0) - (float)(x2 - x0) * (v1 - v0)) / a;
+  if (dvdx > 2000.0f) dvdx = 2000.0f; else if (dvdx < -2000.0f) dvdx = -2000.0f;
+  if (dvdy > 2000.0f) dvdy = 2000.0f; else if (dvdy < -2000.0f) dvdy = -2000.0f;
+  gpu_dplane.dvdx_8 = (s32)(dvdx * 256.0f);
+  gpu_dplane.dvdy_8 = (s32)(dvdy * 256.0f);
+}
 
 int renderer_init(void)
 {
