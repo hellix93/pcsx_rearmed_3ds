@@ -26,6 +26,10 @@
 #include "../gte_arm.h"
 #include "../gte_neon.h"
 #include "pcnt.h"
+#ifdef _3DS
+extern void gpu_unai_depth_record_rtps(const u_int *cp2d);
+extern void gpu_unai_depth_record_rtpt(const u_int *cp2d);
+#endif
 #include "arm_features.h"
 
 #ifdef TC_WRITE_OFFSET
@@ -2133,6 +2137,14 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
         emit_far_call(handler);
         break;
     }
+#ifdef _3DS
+    /* stereo mod: hand the transformed vertices (screen xy + depth) to the GPU plugin */
+    if (c2op == GTEOP_RTPS || c2op == GTEOP_RTPT) {
+      emit_addimm(FP, (u_char *)&psxRegs.CP2D.r[0] - (u_char *)&dynarec_local, 0);
+      emit_far_call(c2op == GTEOP_RTPS ? (void *)gpu_unai_depth_record_rtps
+                                       : (void *)gpu_unai_depth_record_rtpt);
+    }
+#endif
     c2op_epilogue(c2op, reglist);
   }
 }
