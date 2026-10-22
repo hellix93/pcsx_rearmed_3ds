@@ -1269,7 +1269,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
-   info->library_version  = "r26" GIT_VERSION " STEREO-v7";
+   info->library_version  = "r26" GIT_VERSION " STEREO-v8";
    info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
    info->need_fullpath    = true;
 }
@@ -3593,7 +3593,7 @@ static void stereo_clear_map(void)
 }
 
 /* Tells the user what the stereo code is doing; every message starts with
- * "STEREO v7" so it is obvious that this modified core is the one running. */
+ * "STEREO v8" so it is obvious that this modified core is the one running. */
 static void stereo_status(int code, const char *txt)
 {
    static int last = -1;
@@ -3610,8 +3610,7 @@ static void stereo_status(int code, const char *txt)
 
 /* work arrays for one picture row */
 static unsigned short stereo_v[640];        /* depth value of each output pixel */
-static int stereo_cs[641];                  /* running sum of the shifts (box blur) */
-static int stereo_hprev[640];               /* smoothed shift of the row above */
+static signed char stereo_half[640];        /* sideways shift of each output pixel */
 static unsigned char stereo_row8[640 * 4];  /* source row scaled to the eye width */
 
 struct stereo_ctx {
@@ -3620,10 +3619,9 @@ struct stereo_ctx {
 };
 static struct stereo_ctx stereo_c;
 
-/* Row builder in two pixel sizes. Depth -> sideways shift per pixel (HUD: 0),
- * shifts smoothed along the row and with the row above so that neighbouring
- * polygons do not tear apart; pixels with the same shift form runs that are
- * copied as blocks (nearer run wins on overlap, gaps get the background). */
+/* Row builder in two pixel sizes. Depth -> sideways shift per pixel; pixels
+ * with the same shift form runs that are copied as blocks (the nearer run wins
+ * on overlap, gaps are filled with the farther neighbour). */
 static void stereo_run_16(unsigned short *dst, const unsigned short *srow, int xs, int xe, int off, int we,
       int *pend, int *zend, int *started)
 {
@@ -3653,16 +3651,15 @@ static void stereo_run_16(unsigned short *dst, const unsigned short *srow, int x
 }
 
 static void stereo_row_16(const unsigned short *src, unsigned short *dl, unsigned short *dr, const unsigned short *drow,
-      int vimg_x, int vimg_w, int first_row)
+      int vimg_x, int vimg_w)
 {
    const struct stereo_ctx *c = &stereo_c;
    int we = c->we, xo, xs = 0, cur = 0;
    int pl = 0, zl = 0, sl = 0, pr = 0, zr = 0, sr = 0;
    unsigned short *srow = (unsigned short *)stereo_row8;
 
-   stereo_cs[0] = 0;
    for (xo = 0; xo < we; xo++) {
-      int sx = (xo * c->xstep) >> 16, v = 0, h = 0;
+      int sx = (xo * c->xstep) >> 16, v = 0, n, h;
       if (drow) {
          int vx = sx - vimg_x;
          if ((unsigned)vx < (unsigned)vimg_w)
@@ -3670,29 +3667,18 @@ static void stereo_row_16(const unsigned short *src, unsigned short *dl, unsigne
       }
       srow[xo] = src[sx];
       stereo_v[xo] = v;
-      if (v != 65535) {
-         int n = ((v - c->vfar) * c->rcpn) >> 16;
-         if (n < 0) n = 0; else if (n > 256) n = 256;
-         h = ((n - 128) * c->strength * 8) >> 9;
-      }
-      stereo_cs[xo + 1] = stereo_cs[xo] + h;
+      n = ((v - c->vfar) * c->rcpn) >> 16;
+      if (n < 0) n = 0; else if (n > 256) n = 256;
+      h = ((n - 128) * c->strength * 8) >> 9;               /* 1/8 pixel */
+      stereo_half[xo] = (signed char)(h >= 0 ? (h + 4) >> 3 : -((-h + 4) >> 3));
    }
-   for (xo = 0; xo <= we; xo++) {
-      int half = 0;
-      if (xo < we) {
-         int lo = xo - 4 < 0 ? 0 : xo - 4, hi = xo + 4 > we ? we : xo + 4;
-         int hs = (stereo_cs[hi] - stereo_cs[lo]) >> 3, hf = 0;
-         if (stereo_v[xo] != 65535) {
-            hf = first_row ? hs : (hs + 3 * stereo_hprev[xo]) >> 2;
-            stereo_hprev[xo] = hf;
-         }
-         half = hf >= 0 ? (hf + 4) >> 3 : -((-hf + 4) >> 3);
-      }
-      if (xo == 0) { cur = half; xs = 0; continue; }
-      if (xo == we || half != cur) {
+   cur = stereo_half[0];
+   for (xo = 1; xo <= we; xo++) {
+      if (xo == we || stereo_half[xo] != cur) {
          stereo_run_16(dl, srow, xs, xo,  cur, we, &pl, &zl, &sl);
          stereo_run_16(dr, srow, xs, xo, -cur, we, &pr, &zr, &sr);
-         cur = half; xs = xo;
+         if (xo < we) cur = stereo_half[xo];
+         xs = xo;
       }
    }
    for (xo = pl; xo < we; xo++)
@@ -3730,16 +3716,15 @@ static void stereo_run_32(unsigned int *dst, const unsigned int *srow, int xs, i
 }
 
 static void stereo_row_32(const unsigned int *src, unsigned int *dl, unsigned int *dr, const unsigned short *drow,
-      int vimg_x, int vimg_w, int first_row)
+      int vimg_x, int vimg_w)
 {
    const struct stereo_ctx *c = &stereo_c;
    int we = c->we, xo, xs = 0, cur = 0;
    int pl = 0, zl = 0, sl = 0, pr = 0, zr = 0, sr = 0;
    unsigned int *srow = (unsigned int *)stereo_row8;
 
-   stereo_cs[0] = 0;
    for (xo = 0; xo < we; xo++) {
-      int sx = (xo * c->xstep) >> 16, v = 0, h = 0;
+      int sx = (xo * c->xstep) >> 16, v = 0, n, h;
       if (drow) {
          int vx = sx - vimg_x;
          if ((unsigned)vx < (unsigned)vimg_w)
@@ -3747,29 +3732,18 @@ static void stereo_row_32(const unsigned int *src, unsigned int *dl, unsigned in
       }
       srow[xo] = src[sx];
       stereo_v[xo] = v;
-      if (v != 65535) {
-         int n = ((v - c->vfar) * c->rcpn) >> 16;
-         if (n < 0) n = 0; else if (n > 256) n = 256;
-         h = ((n - 128) * c->strength * 8) >> 9;
-      }
-      stereo_cs[xo + 1] = stereo_cs[xo] + h;
+      n = ((v - c->vfar) * c->rcpn) >> 16;
+      if (n < 0) n = 0; else if (n > 256) n = 256;
+      h = ((n - 128) * c->strength * 8) >> 9;               /* 1/8 pixel */
+      stereo_half[xo] = (signed char)(h >= 0 ? (h + 4) >> 3 : -((-h + 4) >> 3));
    }
-   for (xo = 0; xo <= we; xo++) {
-      int half = 0;
-      if (xo < we) {
-         int lo = xo - 4 < 0 ? 0 : xo - 4, hi = xo + 4 > we ? we : xo + 4;
-         int hs = (stereo_cs[hi] - stereo_cs[lo]) >> 3, hf = 0;
-         if (stereo_v[xo] != 65535) {
-            hf = first_row ? hs : (hs + 3 * stereo_hprev[xo]) >> 2;
-            stereo_hprev[xo] = hf;
-         }
-         half = hf >= 0 ? (hf + 4) >> 3 : -((-hf + 4) >> 3);
-      }
-      if (xo == 0) { cur = half; xs = 0; continue; }
-      if (xo == we || half != cur) {
+   cur = stereo_half[0];
+   for (xo = 1; xo <= we; xo++) {
+      if (xo == we || stereo_half[xo] != cur) {
          stereo_run_32(dl, srow, xs, xo,  cur, we, &pl, &zl, &sl);
          stereo_run_32(dr, srow, xs, xo, -cur, we, &pr, &zr, &sr);
-         cur = half; xs = xo;
+         if (xo < we) cur = stereo_half[xo];
+         xs = xo;
       }
    }
    for (xo = pl; xo < we; xo++)
@@ -3783,19 +3757,19 @@ static bool stereo_present(void)
 {
 #ifdef _3DS
    int bytes_pp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
-   int w = vout_width, we, row_b, y, first_row = 1;
+   int w = vout_width, we, row_b, y;
    const unsigned char *src = vout_buf_ptr;
    unsigned char *dst = stereo_buf;
    static int vfar_s, vnear_s;
    static unsigned frame_ctr, last_hit, last_miss, last_rec;
 
    if (!stereo_wanted()) {
-      stereo_status(0, "STEREO v7: 3D off (set 3DS Display Mode = 3D, raise slider)");
+      stereo_status(0, "STEREO v8: 3D off (set 3DS Display Mode = 3D, raise slider)");
       stereo_clear_map();
       return false;
    }
    if (!stereo_buf || !src || !gpu_unai_depth) {
-      stereo_status(1, "STEREO v7: no depth buffer");
+      stereo_status(1, "STEREO v8: no depth buffer");
       stereo_clear_map();
       return false;
    }
@@ -3805,7 +3779,7 @@ static bool stereo_present(void)
    if (!vout_img_ok || w <= 0 || vout_height <= 0 || we * 2 > VOUT_MAX_WIDTH) {
       static char msg[96];
       snprintf(msg, sizeof(msg),
-         "STEREO v7: 3D unavailable (w=%d ok=%d)", w, vout_img_ok);
+         "STEREO v8: 3D unavailable (w=%d ok=%d)", w, vout_img_ok);
       stereo_status(2, msg);
       stereo_clear_map();
       return false;
@@ -3874,25 +3848,24 @@ static bool stereo_present(void)
 
       if (bytes_pp == 4)
          stereo_row_32((const unsigned int *)src, (unsigned int *)dst,
-            (unsigned int *)(dst + row_b), drow, vout_img_x, vout_img_w, first_row);
+            (unsigned int *)(dst + row_b), drow, vout_img_x, vout_img_w);
       else
          stereo_row_16((const unsigned short *)src, (unsigned short *)dst,
-            (unsigned short *)(dst + row_b), drow, vout_img_x, vout_img_w, first_row);
-      first_row = 0;
+            (unsigned short *)(dst + row_b), drow, vout_img_x, vout_img_w);
 
       src += vout_pitch_b;
       dst += row_b * 2;
    }
 
    stereo_send_map(we, vout_height);
-   stereo_status(3, "STEREO v7: 3D ON");
+   stereo_status(3, "STEREO v8: 3D ON");
 
    /* diagnostics: how many vertices got their real depth from the GTE */
    if (++frame_ctr % 120 == 0) {
       static char dmsg[96];
       unsigned h = gpu_unai_zhit - last_hit, m = gpu_unai_zmiss - last_miss;
       unsigned r = gpu_unai_zrec - last_rec;
-      snprintf(dmsg, sizeof(dmsg), "STEREO v7: gte=%u hit=%u%%", r,
+      snprintf(dmsg, sizeof(dmsg), "STEREO v8: gte=%u hit=%u%%", r,
          (h + m) ? h * 100 / (h + m) : 0);
       show_notification(dmsg, 2500, 1, RETRO_LOG_INFO);
       last_hit = gpu_unai_zhit; last_miss = gpu_unai_zmiss; last_rec = gpu_unai_zrec;
