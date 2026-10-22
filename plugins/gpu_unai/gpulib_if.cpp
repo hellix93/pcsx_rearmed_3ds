@@ -116,8 +116,11 @@ void gpu_depth_set_plane(int v0, int x0, int y0, int v1, int x1, int y1, int v2,
   if (v0 >= 0) { sum += v0; known++; }
   if (v1 >= 0) { sum += v1; known++; }
   if (v2 >= 0) { sum += v2; known++; }
-  if (!known) {                       // no GTE depth at all: 2D element (HUD, text)
-    gpu_dplane.ui = true;
+  if (!known) {                       // no GTE depth (2D element, clipped polygon):
+    gpu_dplane.ui = false;            // take the depth of the polygon drawn before it
+    gpu_dplane.xr = x0; gpu_dplane.yr = y0;
+    gpu_dplane.v0_8 = (gpu_depth_lastv ? gpu_depth_lastv : 1) << 8;
+    gpu_dplane.dvdx_8 = gpu_dplane.dvdy_8 = 0;
     return;
   }
   int avg = sum / known;
@@ -212,6 +215,7 @@ void renderer_notify_screen_change(const struct psx_gpu_screen *screen)
     gpu_unai_depth_disp_x = screen->src_x;
     gpu_unai_depth_disp_y = screen->src_y;
     gpu_unai_depth_cur = 1;
+    gpu_depth_lastv = 1;              // a new frame starts at the far end
   }
 
   gpu_unai.inn.ilace_mask = gpu_unai.config.ilace_force;

@@ -477,7 +477,14 @@ static inline void gpu_depth_snap(const le16_t *p, int w, int h)
 		memcpy(&gpu_depth_tmp[y * w], p + (y << 10), w * 2);
 }
 
-#define GPU_DEPTH_UI 65535   // sprites/tiles (HUD, text): drawn at screen depth
+#define GPU_DEPTH_UI 65535   // reserved value (not produced any more)
+
+// semi-transparent primitives (shadows, glass, menu overlays) keep the depth
+// of what lies under them
+static inline bool gpu_prim_semitrans(void)
+{
+	return (gpu_unai.PacketBuffer.U1[3] & 2) != 0;   // command byte, bit 1 = semi-transparent
+}
 
 static inline void gpu_depth_diff(const le16_t *p, int w, int h, u16 r)
 {
@@ -529,19 +536,22 @@ static inline void gpu_depth_diff_plane(const le16_t *p, int w)
 }
 
 #define GPU_TAG_SPAN_Z(px, n, ...) do { \
-	if (gpu_unai_depth_on && gpu_unai_depth) { \
+	if (gpu_unai_depth_on && gpu_unai_depth && !gpu_prim_semitrans()) { \
 		const le16_t *_tp = (px); int _tw = (n); \
 		gpu_depth_snap(_tp, _tw, 1); __VA_ARGS__; gpu_depth_diff_plane(_tp, _tw); \
 	} else { __VA_ARGS__; } } while (0)
 
 // draw call wrappers: run the draw call, then tag changed pixels
 #define GPU_TAG_RECT_R(rank, px, w, h, ...) do { \
-	if (gpu_unai_depth_on && gpu_unai_depth) { \
+	if (gpu_unai_depth_on && gpu_unai_depth && !gpu_prim_semitrans()) { \
 		const le16_t *_tp = (px); int _tw = (w), _th = (h); \
 		gpu_depth_snap(_tp, _tw, _th); __VA_ARGS__; gpu_depth_diff(_tp, _tw, _th, (rank)); \
 	} else { __VA_ARGS__; } } while (0)
 #define GPU_TAG_RECT(px, w, h, ...) GPU_TAG_RECT_R(gpu_depth_rank(), px, w, h, __VA_ARGS__)
-#define GPU_TAG_RECT_UI(px, w, h, ...) GPU_TAG_RECT_R(GPU_DEPTH_UI, px, w, h, __VA_ARGS__)
+// sprites/tiles have no depth of their own: they take the depth of the last 3D
+// polygon (so HUD and text sit in front of the scene, all at the same depth)
+#define GPU_TAG_RECT_LAST(px, w, h, ...) \
+	GPU_TAG_RECT_R((u16)(gpu_depth_lastv ? gpu_depth_lastv : 1), px, w, h, __VA_ARGS__)
 #define GPU_TAG_SPAN(px, n, ...) GPU_TAG_RECT(px, n, 1, __VA_ARGS__)
 
 #endif // GPU_UNAI_H
