@@ -95,6 +95,23 @@ void gteINTPL_part_shift_nf(struct psxCP2Regs *regs);
 void gteMACtoRGB(struct psxCP2Regs *regs);
 void gteMACtoRGB_nf(struct psxCP2Regs *regs);
 
+// --- Stereo 3D: GTE Vertex Depth Cache ---
+extern unsigned short gte_z_cache[65536];
+
+static inline unsigned short gte_zcache_hash(unsigned int sxy) {
+	return (unsigned short)((sxy ^ (sxy >> 16) ^ (sxy >> 7)) & 0xFFFF);
+}
+
+static inline void gte_zcache_store(unsigned int sxy, unsigned short sz) {
+	unsigned short d = (sz == 0) ? 65534 : (sz >= 65534 ? 1 : (65535 - sz));
+	gte_z_cache[gte_zcache_hash(sxy)] = d;
+}
+
+static inline unsigned short gte_zcache_lookup(short x, short y) {
+	unsigned int sxy = ((unsigned int)(unsigned short)y << 16) | (unsigned short)x;
+	return gte_z_cache[gte_zcache_hash(sxy)];
+}
+
 #ifdef __cplusplus
 }
 #endif
