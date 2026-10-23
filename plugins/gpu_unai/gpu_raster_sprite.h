@@ -73,7 +73,15 @@ void gpuDrawS(PtrUnion packet, const PS gpuSpriteDriver, s32 *w_out, s32 *h_out)
 	gpu_unai.inn.v = v0;
 	gpu_unai.inn.y0 = y0;
 	gpu_unai.inn.y1 = y1;
-	GPU_TAG_RECT_UI(Pixel, x1, (y1 - y0), gpuSpriteDriver(Pixel, x1, (u8 *)gpu_unai.inn.TBA, gpu_unai.inn));
+	gpuSpriteDriver(Pixel, x1, (u8 *)gpu_unai.inn.TBA, gpu_unai.inn);
+	if (gpu_unai_stereo_enabled && gpu_unai_vram_r) {
+		le16_t *PixelR = &((le16_t *)gpu_unai_vram_r)[FRAME_OFFSET(x0, y0)];
+		gpu_unai.inn.u = u0;
+		gpu_unai.inn.v = v0;
+		gpu_unai.inn.y0 = y0;
+		gpu_unai.inn.y1 = y1;
+		gpuSpriteDriver(PixelR, x1, (u8 *)gpu_unai.inn.TBA, gpu_unai.inn);
+	}
 }
 
 void gpuDrawT(PtrUnion packet, const PT gpuTileDriver, s32 *w_out, s32 *h_out)
@@ -109,7 +117,13 @@ void gpuDrawT(PtrUnion packet, const PT gpuTileDriver, s32 *w_out, s32 *h_out)
 
 	gpu_unai.inn.y0 = y0;
 	gpu_unai.inn.y1 = y1;
-	GPU_TAG_RECT_UI(Pixel, x1, (y1 - y0), gpuTileDriver(Pixel, Data, x1, gpu_unai.inn));
+	gpuTileDriver(Pixel, Data, x1, gpu_unai.inn);
+	if (gpu_unai_stereo_enabled && gpu_unai_vram_r) {
+		le16_t *PixelR = &((le16_t *)gpu_unai_vram_r)[FRAME_OFFSET(x0, y0)];
+		gpu_unai.inn.y0 = y0;
+		gpu_unai.inn.y1 = y1;
+		gpuTileDriver(PixelR, Data, x1, gpu_unai.inn);
+	}
 }
 
 #endif /* __GPU_UNAI_GPU_RASTER_SPRITE_H__ */

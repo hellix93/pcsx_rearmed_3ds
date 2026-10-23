@@ -87,6 +87,12 @@ void gpuMoveImage(PtrUnion packet)
 
 	if( (x0==x1) && (y0==y1) ) return;
 	if ((w0<=0) || (h0<=0)) return;
+	if (gpu_unai_stereo_enabled && gpu_unai_vram_r && gpu_unai.vram == (le16_t *)gpu.vram) {
+		le16_t *orig_vram = gpu_unai.vram;
+		gpu_unai.vram = (le16_t *)gpu_unai_vram_r;
+		gpuMoveImage(packet);
+		gpu_unai.vram = orig_vram;
+	}
 	
 	#ifdef ENABLE_GPU_LOG_SUPPORT
 		fprintf(stdout,"gpuMoveImage(x0=%u,y0=%u,x1=%u,y1=%u,w0=%d,h0=%d)\n",x0,y0,x1,y1,w0,h0);
@@ -180,8 +186,12 @@ void gpuClearImage(PtrUnion packet)
 		fprintf(stdout,"gpuClearImage(x0=%d,y0=%d,w0=%d,h0=%d)\n",x0,y0,w0,h0);
 	#endif
 
-	if (gpu_unai_depth_on)
-		gpu_depth_clear_rect(x0, y0, w0, h0);
+	if (gpu_unai_stereo_enabled && gpu_unai_vram_r && gpu_unai.vram == (le16_t *)gpu.vram) {
+		le16_t *orig_vram = gpu_unai.vram;
+		gpu_unai.vram = (le16_t *)gpu_unai_vram_r;
+		gpuClearImage(packet);
+		gpu_unai.vram = orig_vram;
+	}
 
 	{
 		le32_t* pixel = (le32_t*)gpu_unai.vram + ((FRAME_OFFSET(x0, y0))>>1);

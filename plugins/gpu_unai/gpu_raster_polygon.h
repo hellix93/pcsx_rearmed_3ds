@@ -64,6 +64,23 @@ enum PolyType {
 // polyInitVertexBuffer()
 // Fills vbuf[] array with data from any type of poly draw-command packet.
 ///////////////////////////////////////////////////////////////////////////////
+#include "../../libpcsxcore/gte.h"
+
+static inline s32 gpu_stereo_calc_vertex_shift(s32 x, s32 y)
+{
+	if (!gpu_unai_eye_shift || !gpu_unai_stereo_strength)
+		return 0;
+	u16 d = gte_zcache_lookup((s16)x, (s16)y);
+	if (d == 0 || d >= 65535)
+		return 0;
+	int sz = 65535 - (int)d;
+	if (sz < 160) sz = 160;
+	int disp = (262144 / sz) - 256;
+	if (disp > 256) disp = 256;
+	if (disp < -256) disp = -256;
+	return ((-gpu_unai_eye_shift) * disp * gpu_unai_stereo_strength) >> 8;
+}
+
 static void polyInitVertexBuffer(PolyVertex *vbuf, const PtrUnion packet, PolyType ptype, u32 is_quad)
 {
 	bool texturing = ptype & POLYATTR_TEXTURE;
@@ -78,12 +95,14 @@ static void polyInitVertexBuffer(PolyVertex *vbuf, const PtrUnion packet, PolyTy
 	int num_verts = (is_quad) ? 4 : 3;
 	le32_t *ptr;
 
-	// X,Y coords
+	// X,Y coords + Per-Vertex GTE Stereo Shift
 	ptr = &packet.U4[1];
 	for (int i=0;  i < num_verts; ++i, ptr += vert_stride) {
 		u32 coords = le32_to_u32(*ptr);
-		vbuf[i].x = GPU_EXPANDSIGN(coords);
-		vbuf[i].y = GPU_EXPANDSIGN(coords >> 16);
+		s32 vx = GPU_EXPANDSIGN(coords);
+		s32 vy = GPU_EXPANDSIGN(coords >> 16);
+		vbuf[i].x = vx + gpu_stereo_calc_vertex_shift(vx, vy);
+		vbuf[i].y = vy;
 	}
 
 	// U,V texture coords (if applicable)

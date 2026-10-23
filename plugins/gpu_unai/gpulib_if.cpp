@@ -51,7 +51,6 @@
 
 // GPU command buffer execution/store
 #include "gpu_command.h"
-#include "../../libpcsxcore/gte.h"
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -61,60 +60,40 @@
 #define IS_OLD_RENDERER() false
 #endif
 
-unsigned short *gpu_unai_depth;
-int gpu_unai_depth_on;
-unsigned gpu_unai_depth_cur = 1;
-int gpu_unai_depth_disp_x, gpu_unai_depth_disp_y;
-unsigned gpu_unai_depth_disp_n = 1;
-u16 gpu_depth_tmp[GPU_DEPTH_TMP_PIXELS];
-
-static inline u16 gpu_get_poly_gte_depth(u32 cmd, const le32_t *list)
-{
-  if (cmd < 0x20 || cmd > 0x3F)
-    return gpu_unai_depth_cur;
-
-  int is_quad = (cmd & 0x08) ? 4 : 3;
-  int stride = 1 + ((cmd & 0x04) ? 1 : 0) + ((cmd & 0x10) ? 1 : 0);
-  const le32_t *ptr = &list[1];
-
-  u32 sum = 0, count = 0;
-  for (int i = 0; i < is_quad; i++, ptr += stride) {
-    u32 coords = le32_to_u32(*ptr);
-    s16 x = (s16)GPU_EXPANDSIGN(coords);
-    s16 y = (s16)GPU_EXPANDSIGN(coords >> 16);
-    u16 d = gte_zcache_lookup(x, y);
-    if (d > 0) {
-      sum += d;
-      count++;
-    }
-  }
-  if (count > 0) {
-    u16 avg_d = (u16)(sum / count);
-    gpu_unai_depth_cur = avg_d;
-    return avg_d;
-  }
-  return gpu_unai_depth_cur;
-}
+uint16_t *gpu_unai_vram_r = NULL;
+int gpu_unai_stereo_enabled = 0;
+int gpu_unai_stereo_strength = 0;
+int gpu_unai_eye_shift = 0;
 
 int renderer_init(void)
 {
-  if (!gpu_unai_depth)
-    gpu_unai_depth = (unsigned short *)calloc(1024 * 512, sizeof(unsigned short));
-  gpu_unai_depth_cur = 1;
+  if (!gpu_unai_vram_r)
+    gpu_unai_vram_r = (uint16_t *)calloc(1024 * 512, sizeof(uint16_t));
   memset((void*)&gpu_unai, 0, sizeof(gpu_unai));
   gpu_unai.vram = (le16_t *)gpu.vram;
 
+  // Original standalone gpu_unai initialized TextureWindow[]. I added the
+  //  same behavior here, since it seems unsafe to leave [2],[3] unset when
+  //  using HLE and Rearmed gpu_neon sets this similarly on init. -senquack
   gpu_unai.TextureWindow[0] = 0;
   gpu_unai.TextureWindow[1] = 0;
   gpu_unai.TextureWindow[2] = 255;
   gpu_unai.TextureWindow[3] = 255;
+  //senquack - new vars must be updated whenever texture window is changed:
+  //           (used for polygon-drawing in gpu_inner.h, gpu_raster_polygon.h)
   gpu_unai.inn.mask_v00u =
     ((u32)gpu_unai.TextureWindow[3] << 24) | gpu_unai.TextureWindow[2];
 
+  // Configuration options
   gpu_unai.config = gpu_unai_config_ext;
+  //senquack - disabled, not sure this is needed and would require modifying
+  // sprite-span functions, perhaps unnecessarily. No Abe Oddysey hack was
+  // present in latest PCSX4ALL sources we were using.
+  //gpu_unai.config.enableAbbeyHack = gpu_unai_config_ext.abe_hack;
   gpu_unai.inn.ilace_mask = gpu_unai.config.ilace_force;
 
 #if defined(GPU_UNAI_USE_INT_DIV_MULTINV) || (!defined(GPU_UNAI_NO_OLD) && !defined(GPU_UNAI_USE_FLOATMATH))
+  // s_invTable
   for(int i=1;i<=(1<<TABLE_BITS);++i)
   {
     double v = 1.0 / double(i);
@@ -135,25 +114,13 @@ int renderer_init(void)
 
 void renderer_finish(void)
 {
-  free(gpu_unai_depth);
-  gpu_unai_depth = NULL;
+  free(gpu_unai_vram_r);
+  gpu_unai_vram_r = NULL;
 }
 
 void renderer_notify_screen_change(const struct psx_gpu_screen *screen)
 {
-  if (gpu_unai_depth_on && gpu_unai_depth
-      && (screen->src_x != gpu_unai_depth_disp_x
-          || screen->src_y != gpu_unai_depth_disp_y))
-  {
-    gpu_unai_depth_disp_n = gpu_unai_depth_cur > 1 ? gpu_unai_depth_cur - 1 : 1;
-    gpu_depth_clear_rect(gpu_unai_depth_disp_x, gpu_unai_depth_disp_y,
-        screen->hres > 0 ? screen->hres : 320,
-        screen->vres > 0 ? screen->vres : 240);
-    gpu_unai_depth_disp_x = screen->src_x;
-    gpu_unai_depth_disp_y = screen->src_y;
-    gpu_unai_depth_cur = 1;
-    memset(gte_z_cache, 0, sizeof(gte_z_cache));
-  }
+  memset(gte_z_cache, 0, sizeof(gte_z_cache));
 
   gpu_unai.inn.ilace_mask = gpu_unai.config.ilace_force;
 
@@ -161,14 +128,23 @@ void renderer_notify_screen_change(const struct psx_gpu_screen *screen)
   {
     gpu_unai.inn.ilace_mask |= !!(gpu.status & PSX_GPU_STATUS_INTERLACE);
   }
+
+  /*
+  printf("res change hres: %d   vres: %d   depth: %d   ilace_mask: %d\n",
+      gpu.screen.hres, gpu.screen.vres, (gpu.status & PSX_GPU_STATUS_RGB24) ? 24 : 15,
+      gpu_unai.ilace_mask);
+  */
 }
 
 #ifdef USE_GPULIB
+// Handles GP0 draw settings commands 0xE1...0xE6
 static void gpuGP0Cmd_0xEx(gpu_unai_t &gpu_unai, u32 cmd_word)
 {
+  // Assume incoming GP0 command is 0xE1..0xE6, convert to 1..6
   u8 num = (cmd_word >> 24) & 7;
   switch (num) {
     case 1: {
+      // GP0(E1h) - Draw Mode setting (aka "Texpage")
       u32 cur_texpage = gpu_unai.GPU_GP1 & 0x7FF;
       u32 new_texpage = cmd_word & 0x7FF;
       if (cur_texpage != new_texpage) {
@@ -178,6 +154,7 @@ static void gpuGP0Cmd_0xEx(gpu_unai_t &gpu_unai, u32 cmd_word)
     } break;
 
     case 2: {
+      // GP0(E2h) - Texture Window setting
       if (cmd_word != gpu_unai.TextureWindowCur) {
         static const u8 TextureMask[32] = {
           255, 7, 15, 7, 31, 7, 15, 7, 63, 7, 15, 7, 31, 7, 15, 7,
@@ -191,6 +168,7 @@ static void gpuGP0Cmd_0xEx(gpu_unai_t &gpu_unai, u32 cmd_word)
         gpu_unai.TextureWindow[0] &= ~gpu_unai.TextureWindow[2];
         gpu_unai.TextureWindow[1] &= ~gpu_unai.TextureWindow[3];
 
+        // Inner loop vars must be updated whenever texture window is changed:
         gpu_unai.inn.mask_v00u =
           ((u32)gpu_unai.TextureWindow[3] << 24) | gpu_unai.TextureWindow[2];
 
@@ -199,21 +177,25 @@ static void gpuGP0Cmd_0xEx(gpu_unai_t &gpu_unai, u32 cmd_word)
     } break;
 
     case 3: {
+      // GP0(E3h) - Set Drawing Area top left (X1,Y1)
       gpu_unai.DrawingArea[0] = cmd_word         & 0x3FF;
       gpu_unai.DrawingArea[1] = (cmd_word >> 10) & 0x3FF;
     } break;
 
     case 4: {
+      // GP0(E4h) - Set Drawing Area bottom right (X2,Y2)
       gpu_unai.DrawingArea[2] = (cmd_word         & 0x3FF) + 1;
       gpu_unai.DrawingArea[3] = ((cmd_word >> 10) & 0x3FF) + 1;
     } break;
 
     case 5: {
+      // GP0(E5h) - Set Drawing Offset (X,Y)
       gpu_unai.DrawingOffset[0] = GPU_EXPANDSIGN(cmd_word);
       gpu_unai.DrawingOffset[1] = GPU_EXPANDSIGN(cmd_word >> 11);
     } break;
 
     case 6: {
+      // GP0(E6h) - Mask Bit Setting
       gpu_unai.Masking  = (cmd_word & 0x2) <<  1;
       gpu_unai.PixelMSB = (cmd_word & 0x1) <<  8;
     } break;
@@ -223,6 +205,7 @@ static void gpuGP0Cmd_0xEx(gpu_unai_t &gpu_unai, u32 cmd_word)
 
 #include "../gpulib/gpu_timing.h"
 
+// Strip lower 3 bits of each color and determine if lighting should be used:
 static inline bool need_lighting(u32 rgb_raw)
 {
   return (rgb_raw & HTOLE32(0xF8F8F8)) != HTOLE32(0x808080);
@@ -235,6 +218,18 @@ static inline void textured_sprite(int &cpu_cycles_sum, int &cpu_cycles)
   u32 driver_idx = Blending_Mode | gpu_unai.TEXT_MODE | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>1);
   s32 w = 0, h = 0;
 
+  //senquack - Only color 808080h-878787h allows skipping lighting calculation:
+  // This fixes Silent Hill running animation on loading screens:
+  // (On PSX, color values 0x00-0x7F darken the source texture's color,
+  //  0x81-FF lighten textures (ultimately clamped to 0x1F),
+  //  0x80 leaves source texture color unchanged, HOWEVER,
+  //   gpu_unai uses a simple lighting LUT whereby only the upper
+  //   5 bits of an 8-bit color are used, so 0x80-0x87 all behave as
+  //   0x80.
+  //
+  // NOTE: I've changed all textured sprite draw commands here and
+  //  elsewhere to use proper behavior, but left poly commands
+  //  alone, I don't want to slow rendering down too much. (TODO)
   if (need_lighting(le32_raw(gpu_unai.PacketBuffer.U4[0])))
     driver_idx |= Lighting;
   PS driver = gpuSpriteDrivers[driver_idx];
@@ -268,8 +263,15 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       break;
     }
 
-    if (gpu_unai_depth_on)
-      gpu_unai_depth_cur = gpu_get_poly_gte_depth(cmd, list);
+    int pass_count = (gpu_unai_stereo_enabled && gpu_unai_vram_r && (cmd >= 0x20 && cmd <= 0x5F)) ? 2 : 1;
+    for (int eye_pass = 0; eye_pass < pass_count; eye_pass++) {
+      if (pass_count == 2) {
+        gpu_unai_eye_shift = (eye_pass == 0) ? -1 : 1;
+        gpu_unai.vram = (eye_pass == 0) ? (le16_t *)gpu.vram : (le16_t *)gpu_unai_vram_r;
+      } else {
+        gpu_unai_eye_shift = 0;
+        gpu_unai.vram = (le16_t *)gpu.vram;
+      }
 
     #define PRIM cmd
     gpu_unai.PacketBuffer.U4[0] = list[0];
@@ -289,7 +291,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x20:
       case 0x21:
       case 0x22:
-      case 0x23: {
+      case 0x23: {          // Monochrome 3-pt poly
         PP driver = gpuPolySpanDrivers[
           Blending_Mode |
           gpu_unai.Masking | Blending | gpu_unai.PixelMSB
@@ -301,7 +303,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x24:
       case 0x25:
       case 0x26:
-      case 0x27: {
+      case 0x27: {          // Textured 3-pt poly
         gpuSetCLUT   (le32_to_u32(gpu_unai.PacketBuffer.U4[2]) >> 16);
         gpuSetTexture(le32_to_u32(gpu_unai.PacketBuffer.U4[4]) >> 16);
 
@@ -325,23 +327,23 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x28:
       case 0x29:
       case 0x2A:
-      case 0x2B: {
+      case 0x2B: {          // Monochrome 4-pt poly
         PP driver = gpuPolySpanDrivers[
           Blending_Mode |
           gpu_unai.Masking | Blending | gpu_unai.PixelMSB
         ];
-        gpuDrawPolyF(packet, driver, true);
+        gpuDrawPolyF(packet, driver, true); // is_quad = true
         gput_sum(cpu_cycles_sum, cpu_cycles, gput_quad_base());
       } break;
 
       case 0x2C:
       case 0x2D:
       case 0x2E:
-      case 0x2F: {
+      case 0x2F: {          // Textured 4-pt poly
         u32 dithering = Dithering;
         u32 simplified_count;
         gpuSetTexture(le32_to_u32(gpu_unai.PacketBuffer.U4[4]) >> 16);
-        if (!dithering &&
+        if (!gpu_unai_stereo_enabled && !dithering &&
             (simplified_count = prim_try_simplify_quad_t(gpu_unai.PacketBuffer.U4,
               gpu_unai.PacketBuffer.U4)))
         {
@@ -368,15 +370,19 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
         }
 
         PP driver = gpuPolySpanDrivers[driver_idx];
-        gpuDrawPolyFT(packet, driver, true);
+        gpuDrawPolyFT(packet, driver, true); // is_quad = true
         gput_sum(cpu_cycles_sum, cpu_cycles, gput_quad_base_t());
       } break;
 
       case 0x30:
       case 0x31:
       case 0x32:
-      case 0x33: {
+      case 0x33: {          // Gouraud-shaded 3-pt poly
         u32 dithering = Dithering;
+        //NOTE: The '129' here is CF_GOURAUD | CF_LIGHT, however
+        // this is an untextured poly, so CF_LIGHT (texture blend)
+        // shouldn't apply. Until the original array of template
+        // instantiation ptrs is fixed, we're stuck with this. (TODO)
         u8 gouraud = 129;
         if (!dithering) {
           u32 xor_ = 0, rgb0 = le32_raw(gpu_unai.PacketBuffer.U4[0]);
@@ -400,7 +406,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x34:
       case 0x35:
       case 0x36:
-      case 0x37: {
+      case 0x37: {          // Gouraud-shaded, textured 3-pt poly
         gpuSetCLUT    (le32_to_u32(gpu_unai.PacketBuffer.U4[2]) >> 16);
         gpuSetTexture (le32_to_u32(gpu_unai.PacketBuffer.U4[5]) >> 16);
         u32 dithering = Dithering;
@@ -422,7 +428,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
           gpu_unai.Masking | Blending | gouraud | lighting | gpu_unai.PixelMSB
         ];
         if (gouraud)
-          gpuDrawPolyGT(packet, driver, false);
+          gpuDrawPolyGT(packet, driver, false); // is_quad = true
         else
           gpuDrawPolyFT(packet, driver, false, POLYTYPE_GT);
         gput_sum(cpu_cycles_sum, cpu_cycles, gput_poly_base_gt());
@@ -431,8 +437,9 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x38:
       case 0x39:
       case 0x3A:
-      case 0x3B: {
+      case 0x3B: {          // Gouraud-shaded 4-pt poly
         u32 dithering = Dithering;
+        // See notes regarding '129' for 0x30..0x33 further above -senquack
         u8 gouraud = 129;
         if (!dithering) {
           u32 xor_ = 0, rgb0 = le32_raw(gpu_unai.PacketBuffer.U4[0]);
@@ -447,7 +454,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
           gpu_unai.Masking | Blending | gouraud | gpu_unai.PixelMSB
         ];
         if (gouraud)
-          gpuDrawPolyG(packet, driver, true);
+          gpuDrawPolyG(packet, driver, true); // is_quad = true
         else
           gpuDrawPolyF(packet, driver, true, POLYTYPE_G);
         gput_sum(cpu_cycles_sum, cpu_cycles, gput_quad_base_g());
@@ -456,11 +463,11 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x3C:
       case 0x3D:
       case 0x3E:
-      case 0x3F: {
+      case 0x3F: {          // Gouraud-shaded, textured 4-pt poly
         u32 dithering = Dithering;
         u32 simplified_count;
         gpuSetTexture(le32_to_u32(gpu_unai.PacketBuffer.U4[5]) >> 16);
-        if (!dithering &&
+        if (!gpu_unai_stereo_enabled && !dithering &&
              (simplified_count = prim_try_simplify_quad_gt(gpu_unai.PacketBuffer.U4,
               gpu_unai.PacketBuffer.U4)))
         {
@@ -491,7 +498,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
           gpu_unai.Masking | Blending | gouraud | lighting | gpu_unai.PixelMSB
         ];
         if (gouraud)
-          gpuDrawPolyGT(packet, driver, true);
+          gpuDrawPolyGT(packet, driver, true); // is_quad = true
         else
           gpuDrawPolyFT(packet, driver, true, POLYTYPE_GT);
         gput_sum(cpu_cycles_sum, cpu_cycles, gput_quad_base_gt());
@@ -500,17 +507,19 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x40:
       case 0x41:
       case 0x42:
-      case 0x43: {
+      case 0x43: {          // Monochrome line
+        // Shift index right by one, as untextured prims don't use lighting
         u32 driver_idx = (Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1;
         PSD driver = gpuPixelSpanDrivers[driver_idx];
         gpuDrawLineF(packet, driver);
         gput_sum(cpu_cycles_sum, cpu_cycles, gput_line(0));
       } break;
 
-      case 0x48 ... 0x4F: {
+      case 0x48 ... 0x4F: { // Monochrome line strip
         u32 num_vertexes = 1;
         le32_t *list_position = &list[2];
 
+        // Shift index right by one, as untextured prims don't use lighting
         u32 driver_idx = (Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1;
         PSD driver = gpuPixelSpanDrivers[driver_idx];
         gpuDrawLineF(packet, driver);
@@ -531,25 +540,29 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
             break;
         }
 
-        len += (num_vertexes - 2);
+        if (eye_pass == pass_count - 1) len += (num_vertexes - 2);
       } break;
 
       case 0x50:
       case 0x51:
       case 0x52:
-      case 0x53: {
+      case 0x53: {          // Gouraud-shaded line
+        // Shift index right by one, as untextured prims don't use lighting
         u32 driver_idx = (Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1;
+        // Index MSB selects Gouraud-shaded PixelSpanDriver:
         driver_idx |= (1 << 5);
         PSD driver = gpuPixelSpanDrivers[driver_idx];
         gpuDrawLineG(packet, driver);
         gput_sum(cpu_cycles_sum, cpu_cycles, gput_line(0));
       } break;
 
-      case 0x58 ... 0x5F: {
+      case 0x58 ... 0x5F: { // Gouraud-shaded line strip
         u32 num_vertexes = 1;
         le32_t *list_position = &list[2];
 
+        // Shift index right by one, as untextured prims don't use lighting
         u32 driver_idx = (Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1;
+        // Index MSB selects Gouraud-shaded PixelSpanDriver:
         driver_idx |= (1 << 5);
         PSD driver = gpuPixelSpanDrivers[driver_idx];
         gpuDrawLineG(packet, driver);
@@ -572,13 +585,13 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
             break;
         }
 
-        len += (num_vertexes - 2) * 2;
+        if (eye_pass == pass_count - 1) len += (num_vertexes - 2) * 2;
       } break;
 
       case 0x60:
       case 0x61:
       case 0x62:
-      case 0x63: {
+      case 0x63: {          // Monochrome rectangle (variable size)
         PT driver = gpuTileDrivers[(Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1];
         s32 w = 0, h = 0;
         gpuDrawT(packet, driver, &w, &h);
@@ -588,14 +601,14 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x64:
       case 0x65:
       case 0x66:
-      case 0x67:
+      case 0x67:            // Textured rectangle (variable size)
         textured_sprite(cpu_cycles_sum, cpu_cycles);
         break;
 
       case 0x68:
       case 0x69:
       case 0x6A:
-      case 0x6B: {
+      case 0x6B: {          // Monochrome rectangle (1x1 dot)
         gpu_unai.PacketBuffer.U4[2] = u32_to_le32(0x00010001);
         PT driver = gpuTileDrivers[(Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1];
         s32 w = 0, h = 0;
@@ -606,7 +619,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x70:
       case 0x71:
       case 0x72:
-      case 0x73: {
+      case 0x73: {          // Monochrome rectangle (8x8)
         gpu_unai.PacketBuffer.U4[2] = u32_to_le32(0x00080008);
         PT driver = gpuTileDrivers[(Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1];
         s32 w = 0, h = 0;
@@ -617,7 +630,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x74:
       case 0x75:
       case 0x76:
-      case 0x77: {
+      case 0x77: {          // Textured rectangle (8x8)
         gpu_unai.PacketBuffer.U4[3] = u32_to_le32(0x00080008);
         textured_sprite(cpu_cycles_sum, cpu_cycles);
       } break;
@@ -625,7 +638,7 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x78:
       case 0x79:
       case 0x7A:
-      case 0x7B: {
+      case 0x7B: {          // Monochrome rectangle (16x16)
         gpu_unai.PacketBuffer.U4[2] = u32_to_le32(0x00100010);
         PT driver = gpuTileDrivers[(Blending_Mode | gpu_unai.Masking | Blending | (gpu_unai.PixelMSB>>3)) >> 1];
         s32 w = 0, h = 0;
@@ -636,17 +649,17 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0x7C:
       case 0x7D:
       case 0x7E:
-      case 0x7F: {
+      case 0x7F: {          // Textured rectangle (16x16)
         gpu_unai.PacketBuffer.U4[3] = u32_to_le32(0x00100010);
         textured_sprite(cpu_cycles_sum, cpu_cycles);
       } break;
 
 #ifdef TEST
-      case 0x80:
+      case 0x80:          //  vid -> vid
         gpuMoveImage(packet);
         break;
 
-      case 0xA0:
+      case 0xA0:          //  sys -> vid
       {
         u32 load_width = list[2] & 0xffff;
         u32 load_height = list[2] >> 16;
@@ -658,21 +671,27 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       case 0xC0:
         break;
 #else
-      case 0x1F:
-      case 0x80 ... 0x9F:
-      case 0xA0 ... 0xBF:
-      case 0xC0 ... 0xDF:
+      case 0x1F:                   //  irq?
+      case 0x80 ... 0x9F:          //  vid -> vid
+      case 0xA0 ... 0xBF:          //  sys -> vid
+      case 0xC0 ... 0xDF:          //  vid -> sys
+        // Handled by gpulib
         goto breakloop;
 #endif
-      case 0xE1 ... 0xE6: {
+      case 0xE1 ... 0xE6: { // Draw settings
         u32 cmd_word = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);
         ex_regs[(cmd_word >> 24) & 7] = cmd_word;
         gpuGP0Cmd_0xEx(gpu_unai, cmd_word);
       } break;
     }
+    } // end eye_pass
+    gpu_unai_eye_shift = 0;
+    gpu_unai.vram = (le16_t *)gpu.vram;
   }
 
 breakloop:
+  gpu_unai_eye_shift = 0;
+  gpu_unai.vram = (le16_t *)gpu.vram;
   ex_regs[1] &= ~0x1ff;
   ex_regs[1] |= gpu_unai.GPU_GP1 & 0x1ff;
 
@@ -685,6 +704,7 @@ breakloop:
 void renderer_sync_ecmds(u32 *ecmds_)
 {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  // the funcs below expect LE
   uint32_t i, ecmds[8];
   for (i = 1; i <= 6; i++)
     ecmds[i] = HTOLE32(ecmds_[i]);
@@ -713,6 +733,7 @@ void renderer_set_interlace(int enable, int is_odd)
 }
 
 #include "../../frontend/plugin_lib.h"
+// Handle any gpulib settings applicable to gpu_unai:
 void renderer_set_config(const struct rearmed_cbs *cbs)
 {
   gpu_unai.vram = (le16_t *)gpu.vram;
@@ -727,3 +748,5 @@ void renderer_set_config(const struct rearmed_cbs *cbs)
   renderer_notify_screen_change(&gpu.screen);
   oldunai_renderer_set_config(cbs);
 }
+
+// vim:shiftwidth=2:expandtab
