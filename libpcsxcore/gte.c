@@ -157,6 +157,12 @@
 #define gteBFC (((s32 *)regs->CP2C.r)[23])
 #define gteOFX (((s32 *)regs->CP2C.r)[24])
 #define gteOFY (((s32 *)regs->CP2C.r)[25])
+// senquack - gteH register is u16, not s16, and used in GTE that way.
+//  HOWEVER when read back by CPU using CFC2, it will be incorrectly
+//  sign-extended by bug in original hardware, according to Nocash docs
+//  GTE section 'Screen Offset and Distance'. The emulator does this
+//  sign extension when it is loaded to GTE by CTC2.
+//#define gteH   (regs->CP2C.p[26].sw.l)
 #define gteH   (regs->CP2C.p[26].w.l)
 #define gteDQA (regs->CP2C.p[27].sw.l)
 #define gteDQB (((s32 *)regs->CP2C.r)[28])
@@ -172,8 +178,11 @@
 #define GTE_LM(op) ((op >> 10) & 1)
 #define GTE_CT(op) ((op >> 6) & 15) /* not used */
 
+// shift the gte 44bit accumulator to 64bit
 #define MAC123_SHIFT (32-12)
 
+// mac 123 without flags (expensive to calculate, rarely used)
+// if your platform is slow, consider adding it here
 #if defined(FLAGLESS) || (defined(__arm__) && !defined(HAVE_ARMV5))
 
 static inline s64 mac123add4(u32 id, u32 *flags, s32 a1, s32 a2, s32 a3, s32 a4, int shift) {
@@ -201,6 +210,17 @@ static inline s64 mac123add(u32 id, u32 *flags, s64 in, s32 addend) {
 	    : [a]"=&r"(a), [flags]"+&r"(*flags), [flag]"+&r"(flag)
 	    : [in]"r"(in), [add]"r"(addend)
 	    : "cc");
+#elif 0 // defined(__aarch64__) // slower
+	u32 flag = 1u << (31 - id);
+	u32 flagpl = 1u << (31 - id - 3);
+	s64 add_ = addend;
+	asm("adds %[a], %[in], %[add], lsl %[shift]\n"
+	    "csel %w[flag], %w[flagpl], %w[flag], pl\n"
+	    "csel %w[flag], %w[flag], wzr, vs\n"
+	    : [a]"=&r"(a), [flag]"+&r"(flag)
+	    : [in]"r"(in), [add]"r"(add_), [flagpl]"r"(flagpl), [shift]"i"(MAC123_SHIFT)
+	    : "cc");
+	*flags |= flag;
 #else
 	int o = __builtin_add_overflow(in, (s64)addend << MAC123_SHIFT, &a);
 	*flags |= (o && a <  0) << (31 - id);
@@ -233,6 +253,18 @@ static inline s64 mac123sub_s12(u32 id, u32 *flags, s32 in12, s32 subtrahend, in
 	    : [a]"=&r"(a), [flags]"+&r"(*flags), [flag]"+&r"(flag)
 	    : [in]"r"(in), [sub]"r"(subtrahend)
 	    : "cc");
+#elif 0 // defined(__aarch64__)
+	u32 flag = 1u << (31 - id);
+	u32 flagpl = 1u << (31 - id - 3);
+	s64 in = (s64)in12 << (12+MAC123_SHIFT);
+	s64 sub_ = subtrahend;
+	asm("subs %[a], %[in], %[sub], lsl %[shift]\n"
+	    "csel %w[flag], %w[flagpl], %w[flag], pl\n"
+	    "csel %w[flag], %w[flag], wzr, vs\n"
+	    : [a]"=&r"(a), [flag]"+&r"(flag)
+	    : [in]"r"(in), [sub]"r"(sub_), [flagpl]"r"(flagpl), [shift]"i"(MAC123_SHIFT)
+	    : "cc");
+	*flags |= flag;
 #else
 	int o = __builtin_sub_overflow((s64)in12 << (12+MAC123_SHIFT), (s64)subtrahend << MAC123_SHIFT, &a);
 	*flags |= (o && subtrahend <  0) << (31 - id);
@@ -246,8 +278,15 @@ static inline s64 mac123sub_s12(u32 id, u32 *flags, s32 in12, s32 subtrahend, in
 #ifndef FLAGLESS
 
 static inline s64 mac0flags(u32 *flags, s64 a) {
+#if 1
 	if (a != (s32)a)
 		*flags |= 1u << (16 + (a >> 63));
+#else
+	if (a > 0x7fffffff)
+		*flags |= 1u << 16;
+	if (a < -(s64)0x80000000)
+		*flags |= 1u << 15;
+#endif
 	return a;
 }
 
@@ -357,11 +396,13 @@ const unsigned char gte_cycletab[64] = {
 	23,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  5,  5, 39,
 };
 
+// warning: ari64 drc stores its negative cycles in gteBusyCycle
 static int gteCheckStallRaw(u32 op_cycles, psxRegisters *regs) {
 	u32 left = regs->gteBusyCycle - regs->cycle;
 	int stall = 0;
 
 	if (left <= 44) {
+		//printf("c %2u stall %2u %u\n", op_cycles, left, regs->cycle);
 		regs->cycle = regs->gteBusyCycle;
 		stall = left;
 	}
@@ -446,6 +487,7 @@ void MTC2(struct psxCP2Regs *regs, u32 value, int reg) {
 
 		case 28:
 			gteIRGB = value;
+			// not gteIR1 etc. just to be consistent with dynarec
 			regs->CP2D.n.ir1 = (value & 0x1f) << 7;
 			regs->CP2D.n.ir2 = (value & 0x3e0) << 2;
 			regs->CP2D.n.ir3 = (value & 0x7c00) >> 3;
@@ -486,10 +528,15 @@ void CTC2(struct psxCP2Regs *regs, u32 value, int reg) {
 
 #endif // FLAGLESS
 
+//#define GTE_USE_NATIVE_DIVIDE
 #ifdef GTE_USE_NATIVE_DIVIDE
+
+// more mathematically correct, but not what the real hardware does
+// (wrong for ~24.72% denominators)
 static inline u32 DIVIDE(u16 n, u16 d) {
 	return (((u32)n << 16) + (d >> 1)) / d;
 }
+
 #else
 #include "gte_divider.h"
 #endif
@@ -1063,13 +1110,13 @@ static inline void runColor3(psxCP2Regs *regs, int shift, int lm, int is_cdp)
 	gteMAC3 = mac3;
 	gteIR1 = limB1(&flags, mac1, lm);
 	gteIR2 = limB2(&flags, mac2, lm);
-	gteIR3 = limB3(&flags, gteMAC3, lm);
+	gteIR3 = limB3(&flags, mac3, lm);
 	gteRGB0 = gteRGB1;
 	gteRGB1 = gteRGB2;
 	gteCODE2 = gteCODE;
 	gteR2 = limC1(&flags, mac1 >> 4);
-	gteG2 = limC2(&flags, gteMAC2 >> 4);
-	gteB2 = limC3(&flags, gteMAC3 >> 4);
+	gteG2 = limC2(&flags, mac2 >> 4);
+	gteB2 = limC3(&flags, mac3 >> 4);
 	gteFLAG = getFinalFlag(flags);
 }
 
@@ -1181,6 +1228,7 @@ static void (*gteOPS[0x40*(4+1)])(psxCP2Regs *regs, u32 code) =
 	TABLE_ENTRY4(OP),
 	TABLE_ENTRY4(DPCS),
 	TABLE_ENTRY4(INTPL),
+	//TABLE_ENTRY1(MVMVA),
 	TABLE_ENTRY4(NCDS),
 	TABLE_ENTRY4(CDP),
 	TABLE_ENTRY4(NCDT),
@@ -1208,14 +1256,14 @@ gte_handler * NM(gteGetHandler)(u32 code)
 	if (h)
 		return h;
 	if (op == GTEOP_MVMVA) {
-		if (code & ((1u << 18) | (1u << 14)))
+		if (code & ((1u << 18) | (1u << 14))) // "bugged" mx/cv
 			h = NM(gteMVMVA_generic);
 		else {
-			l = ((code >> (19-5)) & 0x20) |
-			    ((code >> (17-4)) & 0x10) |
-			    ((code >> (15-2)) & 0x0c) |
-			    ((code >> (13-1)) & 0x02) |
-			    ((code >>  10)    & 0x01);
+			l = ((code >> (19-5)) & 0x20) | // sf
+			    ((code >> (17-4)) & 0x10) | // mx
+			    ((code >> (15-2)) & 0x0c) | // v
+			    ((code >> (13-1)) & 0x02) | // cv
+			    ((code >>  10)    & 0x01);  // lm
 			h = gteOPS[0x40*4 + l];
 		}
 	}
@@ -1233,6 +1281,8 @@ void gteDispatch(psxCP2Regs *regs, u32 code)
 		log_unhandled("unhandled gte op %08x\n", code);
 }
 
+/* decomposed/parametrized versions for the recompiler */
+
 void gteSQR_part_noshift(psxCP2Regs *regs) {
 	gteMAC1 = gteIR1 * gteIR1;
 	gteMAC2 = gteIR2 * gteIR2;
@@ -1248,7 +1298,7 @@ void gteSQR_part_shift(psxCP2Regs *regs) {
 void gteOP_part_noshift(psxCP2Regs *regs) {
 	gteMAC1 = (gteR22 * gteIR3) - (gteR33 * gteIR2);
 	gteMAC2 = (gteR33 * gteIR1) - (gteR11 * gteIR3);
-	gteMAC3 = ((gteR11 * gteIR2) - (gteR22 * gteIR1));
+	gteMAC3 = (gteR11 * gteIR2) - (gteR22 * gteIR1);
 }
 
 void gteOP_part_shift(psxCP2Regs *regs) {
