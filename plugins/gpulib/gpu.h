@@ -170,16 +170,23 @@ int  prim_try_simplify_quad_gt(void *simplified, const void *prim);
 
 void cpy_mask(uint16_t *dst, const uint16_t *src, int l, uint32_t r6);
 
+extern uint16_t *gpu_unai_vram_r;
 static inline void do_vram_line(uint16_t *vram_, int x, int y,
     uint16_t *mem, int l, int is_read, uint32_t r6)
 {
   uint16_t *vram = VRAM_MEM_XY(vram_, x, y);
   if (unlikely(is_read))
     memcpy(mem, vram, l * 2);
-  else if (unlikely(r6))
+  else if (unlikely(r6)) {
     cpy_mask(vram, mem, l, r6);
-  else
+    if (gpu_unai_vram_r && vram_ == gpu.vram)
+      cpy_mask(VRAM_MEM_XY(gpu_unai_vram_r, x, y), mem, l, r6);
+  }
+  else {
     memcpy(vram, mem, l * 2);
+    if (gpu_unai_vram_r && vram_ == gpu.vram)
+      memcpy(VRAM_MEM_XY(gpu_unai_vram_r, x, y), mem, l * 2);
+  }
 }
 
 /* listing these here for correct linkage if rasterizer uses c++ */

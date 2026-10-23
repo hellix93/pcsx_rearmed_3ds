@@ -685,6 +685,8 @@ int do_vram_copy(uint16_t *vram, const uint32_t *ex_regs, const uint32_t *params
     }
   }
 
+  if (gpu_unai_vram_r && vram == gpu.vram)
+    do_vram_copy(gpu_unai_vram_r, ex_regs, params);
   renderer_update_caches(dx, dy, w, h, 0);
   return 4;
 }
