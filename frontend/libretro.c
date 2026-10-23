@@ -67,7 +67,7 @@
 #endif
 
 #ifndef min
-#define min(a, b) ((a) < (b) ? (a) : (b))
+#define min(a, b) ((b) < (a) ? (b) : (a))
 #endif
 #ifndef MAP_FAILED
 #define MAP_FAILED      ((void *)(intptr_t)-1)
@@ -113,6 +113,8 @@ static unsigned msg_interface_version = 0;
 
 /* --- stereo 3D (libretro "video views") support, see stereo3d section --- */
 #ifndef RETRO_ENVIRONMENT_SET_VIDEO_VIEWS
+/* Local copy of the definitions from newer libretro.h (RetroArch master),
+ * so that the bundled older header still compiles. Layout must match. */
 #define RETRO_ENVIRONMENT_SET_VIDEO_VIEWS (95 | RETRO_ENVIRONMENT_EXPERIMENTAL)
 #define RETRO_ENVIRONMENT_GET_VIDEO_VIEWS_STATUS (96 | RETRO_ENVIRONMENT_EXPERIMENTAL)
 #define RETRO_VIDEO_VIEWS_STATUS_PRESENTS (1 << 0)
@@ -132,27 +134,18 @@ struct retro_video_views
    const struct retro_video_view *views;
    unsigned num_views;
    unsigned flags;
-   int reference_space;
+   int reference_space; /* enum in libretro.h, int sized */
    unsigned recommended_view_width;
    unsigned recommended_view_height;
 };
 #endif
 static void *stereo_buf;
-static int stereo_z[640];
-static int stereo_h[640];
-static int stereo_cs[641];
-static int stereo_hprev[640];
-static int stereo_zl[640], stereo_zr[640];
-static unsigned char stereo_ui[640], stereo_fl[640], stereo_fr[640];
-static const int stereo_rcp9[10] = { 0, 65536, 32768, 21845, 16384, 13107, 10923, 9362, 8192, 7282 };
+static void *vout_buf_r;
 static bool stereo_map_sent;
 static int vout_img_x, vout_img_y, vout_img_w, vout_img_h, vout_img_ok;
-#ifdef _3DS
-extern unsigned short *gpu_unai_depth;
-extern int gpu_unai_depth_on;
-extern int gpu_unai_depth_disp_x, gpu_unai_depth_disp_y;
-extern unsigned gpu_unai_depth_disp_n;
-#endif
+extern uint16_t *gpu_unai_vram_r;
+extern int gpu_unai_stereo_enabled;
+extern int gpu_unai_stereo_strength;
 static void *vout_buf;
 static void *vout_buf_ptr;
 static int vout_width = 256, vout_height = 240, vout_pitch_b = 256*2;
@@ -206,6 +199,7 @@ static int plugins_opened;
 
 #define is_pal_mode Config.PsxType
 
+/* PCSX ReARMed core calls and stuff */
 int in_type[8] = {
    PSE_PAD_TYPE_NONE, PSE_PAD_TYPE_NONE,
    PSE_PAD_TYPE_NONE, PSE_PAD_TYPE_NONE,
@@ -223,12 +217,28 @@ static int in_enable_crosshair[2] = { 0, 0 };
 static int in_dualshock_analog_combo = 0;
 static bool in_dualshock_toggling = false;
 
+// NegCon adjustment parameters
+// > The NegCon 'twist' action is somewhat awkward when mapped
+//   to a standard analog stick -> user should be able to tweak
+//   response/deadzone for comfort
+// > When response is linear, 'additional' deadzone (set here)
+//   may be left at zero, since this is normally handled via in-game
+//   options menus
+// > When response is non-linear, deadzone should be set to match the
+//   controller being used (otherwise precision may be lost)
+// > negcon_linearity:
+//   - 1: Response is linear - recommended when using racing wheel
+//        peripherals, not recommended for standard gamepads
+//   - 2: Response is quadratic - optimal setting for gamepads
+//   - 3: Response is cubic - enables precise fine control, but
+//        difficult to use...
 #define NEGCON_RANGE 0x7FFF
 static int negcon_deadzone = 0;
 static int negcon_linearity = 1;
 
 static bool axis_bounds_modifier;
 
+/* PSX max resolution is 640x512, but with enhancement it's 1024x512 */
 #ifdef GPU_NEON
 #define VOUT_MAX_WIDTH  1024
 #else
@@ -236,6 +246,7 @@ static bool axis_bounds_modifier;
 #endif
 #define VOUT_MAX_HEIGHT 512
 
+//Dummy functions
 bool retro_load_game_special(unsigned game_type, const struct retro_game_info *info, size_t num_info) { return false; }
 void retro_unload_game(void) {}
 static int vout_open(void) { return 0; }
@@ -378,6 +389,11 @@ static void vout_set_mode(int w, int h, int raw_w, int raw_h, int bpp)
          vout_height = h / 2;
    }
 
+   /* it may seem like we could do RETRO_ENVIRONMENT_SET_PIXEL_FORMAT here to
+    * switch to something that can accommodate bgr24 for FMVs, but although it
+    * succeeds it doesn't actually change the format at least on Linux, and the
+    * docs say only retro_load_game() can do it */
+
    if (current_width != vout_width || current_height != vout_height)
    {
       current_width = vout_width;
@@ -392,9 +408,11 @@ static void vout_set_mode(int w, int h, int raw_w, int raw_h, int bpp)
    set_bgr_to_fb_func(bpp == 24);
 }
 
+// Function to add crosshairs
 static void addCrosshair(int port, int crosshair_color, unsigned short *buffer, int bufferStride, int pos_x, int pos_y, int thickness, int size_x, int size_y)
 {
    for (port = 0; port < 2; port++) {
+      // Draw the horizontal line of the crosshair
       int i, j;
       for (i = pos_y - thickness / 2; i <= pos_y + thickness / 2; i++) {
          for (j = pos_x - size_x / 2; j <= pos_x + size_x / 2; j++) {
@@ -403,6 +421,7 @@ static void addCrosshair(int port, int crosshair_color, unsigned short *buffer, 
          }
       }
 
+      // Draw the vertical line of the crosshair
       for (i = pos_x - thickness / 2; i <= pos_x + thickness / 2; i++) {
          for (j = pos_y - size_y / 2; j <= pos_y + size_y / 2; j++) {
             if (i >= 0 && i < bufferStride && (j + vout_height) >= 0 && (j + vout_height) < bufferStride && in_enable_crosshair[port] > 0)
@@ -416,10 +435,11 @@ struct CrosshairInfo {
    int pos_x, pos_y, thickness, size_x, size_y;
 };
 
+// Calculate size and position of crosshairs
 static void CrosshairDimensions(int port, struct CrosshairInfo *info) {
    int gunx = input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X);
    int guny = input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y);
-   if (gunx == 32767)
+   if (gunx == 32767) // Prevent crosshairs from wrapping around right side of screen to left
       info->pos_x = (gunx + 32767.0f) * vout_width / 65534.0f - 0.5f;
    else
       info->pos_x = (gunx + 32767.0f) * vout_width / 65534.0f;
@@ -458,6 +478,7 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
       else
          for (; h2-- > 0; dest2 += dstride)
             memset(dest2, 0, ll);
+      // blanking
       if (vram == NULL)
          goto out;
    }
@@ -476,6 +497,7 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
 
    hwrapped = (vram_ofs & 2047) + w * bytes_pp_s - 2048;
    if (!enhres && hwrapped > 0) {
+      // this is super-rare so just fix-up
       w_blit = hwrapped / bytes_pp_s;
       vram_ofs = (vram_ofs - h * sstride) & 0xff800;
       dest -= dstride * h;
@@ -498,6 +520,17 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
       }
    }
 
+   if (gpu_unai_stereo_enabled && gpu_unai_vram_r && vout_buf_r && vram == (const unsigned char *)gpu.vram && !bgr24 && !enhres) {
+      unsigned char *dest_r = (unsigned char *)vout_buf_r + x * bytes_pp + y * dstride;
+      const unsigned char *vram_r = (const unsigned char *)gpu_unai_vram_r;
+      int vram_ofs_r = (vram_ofs - h * sstride) & vram_mask;
+      int w_blit_r = min(w, vout_width);
+      for (h1 = h; h1-- > 0; dest_r += dstride) {
+         bgr_to_fb(dest_r, vram_r + vram_ofs_r, w_blit_r);
+         vram_ofs_r = (vram_ofs_r + sstride) & vram_mask;
+      }
+   }
+
 out:
    vout_fb_dirty = 1;
    pl_rearmed_cbs.flip_cnt++;
@@ -508,6 +541,7 @@ static u32 mapped_addrs[8];
 static u32 mapped_ram, mapped_ram_src;
 static void *vram_mem;
 
+// http://3dbrew.org/wiki/Memory_layout#ARM11_User-land_memory_regions
 static void *pl_3ds_mmap(unsigned long addr, size_t size,
     enum psxMapTag tag, int *can_retry_addr)
 {
@@ -520,6 +554,7 @@ static void *pl_3ds_mmap(unsigned long addr, size_t size,
 
    if (__ctr_svchax) do
    {
+      // idea from fbalpha2012_neogeo
       s32 addr = 0x10000000 - 0x1000;
       u32 found_addr = 0;
       MemInfo mem_info;
@@ -554,14 +589,16 @@ static void *pl_3ds_mmap(unsigned long addr, size_t size,
          break;
       }
 
+      // https://libctru.devkitpro.org/svc_8h.html#a8046e9b23b1b209a4e278cb1c19c7a5a
       if ((r = svcControlMemory(&mapped_addrs[i], found_addr, 0, size, MEMOP_ALLOC, MEMPERM_READWRITE)) < 0) {
          LogErr("svcControlMemory failed for %08x %u: %d\n", found_addr, size, r);
          break;
       }
-      if (mapped_addrs[i] == 0)
+      if (mapped_addrs[i] == 0) // needed?
          mapped_addrs[i] = found_addr;
       ret = (void *)mapped_addrs[i];
 
+      // "round" address helps the dynarec slightly, map ram at 0x13000000
       if (tag == MAP_TAG_RAM && !mapped_ram) {
          u32 target = 0x13000000;
          if ((r = svcControlMemory(&mapped_ram, target, mapped_addrs[i], size, MEMOP_MAP, MEMPERM_READWRITE)) < 0)
@@ -612,6 +649,7 @@ static void pl_3ds_munmap(void *ptr, size_t size, enum psxMapTag tag)
    free(ptr);
 }
 
+// debug
 static int ctr_get_tlbe_k(u32 ptr)
 {
    u32 tlb_base = -1, tlb_ctl = -1, *l1;
@@ -649,6 +687,8 @@ static void *pl_switch_mmap(unsigned long addr, size_t size,
    *can_retry_addr = 0;
    (void)addr;
 
+   // there's svcMapPhysicalMemory() but user logs show it doesn't hand out
+   // any desired addresses, so don't even bother
    ret = aligned_alloc(0x1000, size);
    if (!ret)
       return MAP_FAILED;
@@ -680,7 +720,7 @@ static psx_map_t custom_psx_maps[] = {
    { NULL, 0x080000, MAP_TAG_OTHER },
    { NULL, 0x010000, MAP_TAG_OTHER },
    { NULL, 0x201000, MAP_TAG_VRAM },
-   { NULL, 0x802000, MAP_TAG_VRAM },
+   { NULL, 0x802000, MAP_TAG_VRAM }, // enhanced renderer
    { NULL, 0x210000, MAP_TAG_RAM },
 };
 
@@ -698,6 +738,12 @@ static int init_vita_mmap()
    custom_psx_maps[4].buffer = tmpaddr + 0x1000000;
    custom_psx_maps[5].buffer = tmpaddr + 0x2000000;
    memset(tmpaddr, 0, 0x2210000);
+#if 0
+   int n;
+   for(n = 0; n < 5; n++){
+   sceClibPrintf("addr reserved %x\n",custom_psx_maps[n].buffer);
+   }
+#endif
    return 0;
 }
 
@@ -756,7 +802,7 @@ static void log_mem_usage(int only_if_oom)
 {
 #ifdef _3DS
    extern u32 __heap_size, __linear_heap_size, __stacksize__;
-   extern char __end__;
+   extern char __end__; // 3dsx.ld
    u32 sp, app_memory = 0;
    u32 mem_used = 0;
    void *heap;
@@ -797,12 +843,14 @@ struct rearmed_cbs pl_rearmed_cbs = {
    .mmap             = pl_mmap,
    .munmap           = pl_munmap,
    .gpu_state_change = gpu_state_change,
+   /* from psxcounters */
    .gpu_hcnt         = &hSyncCount,
    .gpu_frame_count  = &frame_counter,
 };
 
 void pl_frame_limit(void)
 {
+   /* called once per frame, make psxCpu->Execute() above return */
    psxRegs.stop++;
 }
 
@@ -822,6 +870,7 @@ void plat_trigger_vibrate(int pad, int low, int high)
    }
 }
 
+//Percentage distance of screen to adjust for Konami Gun
 static float KonamiGunAdjustX = 0;
 static float KonamiGunAdjustY = 0;
 
@@ -842,12 +891,13 @@ void pl_gun_byte2(int port, unsigned char byte)
       justifier_multiplier = is_pal_mode ? .224409f : .226475f;
    else if (justifier_width == 512)
       justifier_multiplier = is_pal_mode ? .314173f : .317065f;
-   else
+   else // (justifier_width == 640)
       justifier_multiplier = is_pal_mode ? .392717f : .396332f;
 
    int gunx = input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X);
    int guny = input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y);
 
+   //Default offset of +105 for X and -12 for Y is chosen to obtain alignment in Die Hard Trilogy, which has no calibration feature
    int gunx_scaled = ((gunx + 32767.0f) / 65534.0f + KonamiGunAdjustX) * justifier_width / justifier_multiplier + 105.0f;
    int guny_scaled = ((guny + 32767.0f) / 65534.0f + KonamiGunAdjustY) * justifier_height - 12.0f;
 
@@ -857,6 +907,7 @@ void pl_gun_byte2(int port, unsigned char byte)
    }
 }
 
+/* sound calls */
 static void snd_feed(void *buf, int bytes)
 {
    if (audio_batch_cb != NULL)
@@ -909,6 +960,8 @@ static const struct retro_controller_info ports[9] =
    { NULL, 0 },
 };
 
+/* libretro */
+
 static bool update_option_visibility(void)
 {
    struct retro_variable var                       = {0};
@@ -916,6 +969,9 @@ static bool update_option_visibility(void)
    bool updated                                    = false;
    unsigned i;
 
+   /* If frontend supports core option categories
+    * then show/hide core option entries are ignored
+    * and no options should be hidden */
    if (libretro_supports_option_categories)
       return false;
 
@@ -1069,9 +1125,20 @@ void retro_set_environment(retro_environment_t cb)
 
    environ_cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
 
+   /* Set core options
+    * An annoyance: retro_set_environment() can be called
+    * multiple times, and depending upon the current frontend
+    * state various environment callbacks may be disabled.
+    * This means the reported 'categories_supported' status
+    * may change on subsequent iterations. We therefore have
+    * to record whether 'categories_supported' is true on any
+    * iteration, and latch the result */
    libretro_set_core_options(environ_cb, &option_categories);
    libretro_supports_option_categories |= option_categories;
 
+   /* If frontend supports core option categories,
+    * any show/hide core option entries are unused
+    * and should be hidden */
    if (libretro_supports_option_categories)
    {
       struct retro_core_option_display option_display;
@@ -1092,6 +1159,11 @@ void retro_set_environment(retro_environment_t cb)
             &option_display);
 #endif
    }
+   /* If frontend does not support core option
+    * categories, core options may be shown/hidden
+    * at runtime. In this case, register 'update
+    * display' callback, so frontend can update
+    * core options menu without calling retro_run() */
    else
    {
       struct retro_core_options_update_display_callback update_display_cb;
@@ -1102,7 +1174,7 @@ void retro_set_environment(retro_environment_t cb)
    }
 
 #ifdef USE_LIBRETRO_VFS
-   vfs_iface_info.required_interface_version = 3;
+   vfs_iface_info.required_interface_version = 3; /* stat */
    vfs_iface_info.iface                      = NULL;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_iface_info))
    {
@@ -1203,7 +1275,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
-   info->library_version  = "r26" GIT_VERSION " STEREO-GTE";
+   info->library_version  = "r26" GIT_VERSION " STEREO-MODE2";
    info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
    info->need_fullpath    = true;
 }
@@ -1223,8 +1295,11 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.aspect_ratio   = 4.0 / 3.0;
 }
 
+/* savestates */
 size_t retro_serialize_size(void)
 {
+   // it's currently 4380651-4397047 bytes,
+   // but have some reserved for future
    return 0x440000;
 }
 
@@ -1304,6 +1379,7 @@ static void save_close(void *file)
    if (fp->pos > r_size)
       LogErr("ERROR: save buffer overflow detected\n");
    else if (fp->is_write && fp->pos < r_size)
+      // make sure we don't save trash in leftover space
       memset(fp->buf + fp->pos, 0, r_size - fp->pos);
    free(fp);
 }
@@ -1318,6 +1394,7 @@ bool retro_serialize(void *data, size_t size)
    CdromFrontendId = disk_current_index;
    ret = SaveState(data);
 
+   // old3ds tends to oom here, so log
    log_mem_usage(1);
    return ret == 0 ? true : false;
 }
@@ -1336,6 +1413,7 @@ bool retro_unserialize(const void *data, size_t size)
    return true;
 }
 
+/* cheats */
 void retro_cheat_reset(void)
 {
    ClearAllCheats();
@@ -1346,10 +1424,12 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
    int ret = -1;
    char *buf;
 
+   // cheat funcs are destructive, need a copy...
    buf = strdup(code);
    if (buf == NULL)
       goto finish;
 
+   //Prepare buffered cheat for PCSX's AddCheat fucntion.
    int cursor = 0;
    int nonhexdec = 0;
    while (buf[cursor])
@@ -1381,6 +1461,7 @@ finish:
    free(buf);
 }
 
+// just in case, maybe a win-rt port in the future?
 #ifdef _WIN32
 #define SLASH '\\'
 #else
@@ -1391,6 +1472,7 @@ finish:
 #define PATH_MAX 4096
 #endif
 
+/* multidisk support */
 static unsigned int disk_initial_index;
 static char disk_initial_path[PATH_MAX];
 static bool disk_ejected;
@@ -1399,7 +1481,7 @@ static struct disks_state
 {
    char *fname;
    char *flabel;
-   int internal_index;
+   int internal_index; // for multidisk eboots
 } disks[8];
 
 static void get_disk_label(char *disk_label, const char *disk_path, size_t len)
@@ -1453,6 +1535,7 @@ static bool disk_set_eject_state(bool ejected)
    if (ejected != disk_ejected)
       SysPrintf("new eject_state: %d\n", ejected);
 
+   // weird PCSX API...
    SetCdOpenCaseTime(ejected ? -1 : (time(NULL) + 2));
    LidInterrupt();
 
@@ -1460,6 +1543,7 @@ static bool disk_set_eject_state(bool ejected)
    if (cdra_is_physical() && ejected != disk_ejected) {
       cdra_stop_thread();
       if (!ejected) {
+         // likely the real cd was also changed - rescan
          cdra_close();
          cdra_open();
       }
@@ -1471,6 +1555,7 @@ static bool disk_set_eject_state(bool ejected)
 
 static bool disk_get_eject_state(void)
 {
+   /* can't be controlled by emulated software */
    return disk_ejected;
 }
 
@@ -1492,6 +1577,8 @@ static bool disk_set_image_index(unsigned int index)
       LogErr("missing disk #%u\n", index);
       cdra_shutdown();
 
+      // RetroArch specifies "no disk" with index == count,
+      // so don't fail here..
       disk_current_index = index;
       return true;
    }
@@ -1722,6 +1809,11 @@ static void extract_directory(char *buf, const char *path, size_t size)
 }
 
 #if defined(__QNX__) || defined(_WIN32)
+/* Blackberry QNX doesn't have strcasestr */
+
+/*
+ * Find the first occurrence of find in s, ignore case.
+ */
 char *
 strcasestr(const char *s, const char *find)
 {
@@ -1753,6 +1845,7 @@ static void set_retro_memmap(void)
    struct retro_memory_descriptor descs[] = {
       { flags_ram, psxRegs.ptrs.psxM, 0, 0x00000000, 0x5fe00000, 0, 0x200000 },
       { flags_ram, psxRegs.ptrs.psxH, 0, 0x1f800000, 0x7ffffc00, 0, 0x000400 },
+      // not ram but let the frontend patch it if it wants; should be last
       { flags_ram, psxRegs.ptrs.psxR, 0, 0x1fc00000, 0x5ff80000, 0, 0x080000 },
    };
 
@@ -1833,8 +1926,15 @@ static void retro_set_audio_buff_status_cb(void)
 
       if (calculate_audio_latency)
       {
+         /* Frameskip is enabled - increase frontend
+          * audio latency to minimise potential
+          * buffer underruns */
          uint32_t frame_time_usec = 1000000.0 / (is_pal_mode ? 50.0 : 60.0);
+
+         /* Set latency... */
          retro_audio_latency = (unsigned)((4 + frameskip_interval * 2) * frame_time_usec / 1000);
+
+         /* ...then round up to nearest multiple of 32 */
          retro_audio_latency = (retro_audio_latency + 0x1F) & ~0x1F;
       }
    }
@@ -1999,6 +2099,8 @@ bool retro_load_game(const struct retro_game_info *info)
       disks[0].flabel = strdup(disk_label);
    }
 
+   /* If this is an M3U file, attempt to set the
+    * initial disk image */
    if (is_m3u && (disk_initial_index > 0) && (disk_initial_index < disk_count))
    {
       const char *fname = disks[disk_initial_index].fname;
@@ -2011,6 +2113,7 @@ bool retro_load_game(const struct retro_game_info *info)
    set_cd_image(disks[cd_index].fname);
    disk_current_index = cd_index;
 
+   /* have to reload after set_cd_image for correct cdr plugin */
    if (LoadPlugins() == -1)
    {
       LogErr("failed to load plugins\n");
@@ -2035,10 +2138,16 @@ bool retro_load_game(const struct retro_game_info *info)
       return false;
    }
 
+   /* Handle multi-disk images (i.e. PBP)
+    * > Cannot do this until after OpenPlugins() is
+    *   called (since this sets the value of
+    *   cdrIsoMultidiskCount) */
    if (!is_m3u && (cdrIsoMultidiskCount > 1))
    {
       disk_count = cdrIsoMultidiskCount < 8 ? cdrIsoMultidiskCount : 8;
 
+      /* Small annoyance: We need to change the label
+       * of disk 0, so have to clear existing entries */
       if (disks[0].fname != NULL)
          free(disks[0].fname);
       disks[0].fname = NULL;
@@ -2061,6 +2170,9 @@ bool retro_load_game(const struct retro_game_info *info)
          disks[i].internal_index = i;
       }
 
+      /* This is not an M3U file, so initial disk
+       * image has not yet been set - attempt to
+       * do so now */
       if ((disk_initial_index > 0) && (disk_initial_index < disk_count))
       {
          const char *fname = disks[disk_initial_index].fname;
@@ -2092,6 +2204,7 @@ bool retro_load_game(const struct retro_game_info *info)
       }
    }
 
+   /* set ports to use "standard controller" initially */
    for (i = 0; i < 8; ++i)
       in_type[i] = PSE_PAD_TYPE_STANDARD;
 
@@ -2129,6 +2242,7 @@ bool retro_load_game(const struct retro_game_info *info)
 #ifdef _3DS
    u32 mem_used = 0, mem_avail = 0;
    ctr_get_mem_info(&mem_used, &mem_avail);
+   // 5 buffers: load undo, save undo, current load/save, backup copy, ram save
    if (mem_avail - mem_used < 5 * retro_serialize_size() * 11 / 10) {
       bool true_ = true;
       environ_cb(RETRO_ENVIRONMENT_SET_SAVE_STATE_DISABLE_UNDO, &true_);
@@ -2187,7 +2301,9 @@ size_t retro_get_memory_size(unsigned id)
 
 void retro_reset(void)
 {
+   //hack to prevent retroarch freezing when reseting in the menu but not while running with the hot key
    reset_pending = true;
+   //SysReset();
 }
 
 static const unsigned short retro_psx_map[] = {
@@ -2210,8 +2326,11 @@ static const unsigned short retro_psx_map[] = {
 };
 #define RETRO_PSX_MAP_LEN (sizeof(retro_psx_map) / sizeof(retro_psx_map[0]))
 
+//Percentage distance of screen to adjust for Guncon
 static int GunconAdjustX = 0;
 static int GunconAdjustY = 0;
+
+//Used when out by a percentage with Guncon
 static float GunconAdjustRatioX = 1;
 static float GunconAdjustRatioY = 1;
 
@@ -2219,6 +2338,9 @@ static void update_variables(bool in_flight)
 {
    struct retro_variable var;
 #ifdef GPU_PEOPS
+   // Always enable GPU_PEOPS_OLD_FRAME_SKIP flag
+   // (this is set in standalone, with no option
+   // to change it)
    int gpu_peops_fix = GPU_PEOPS_OLD_FRAME_SKIP;
 #endif
    frameskip_type_t prev_frameskip_type;
@@ -2378,7 +2500,7 @@ static void update_variables(bool in_flight)
          pl_rearmed_cbs.gpu_neon.allow_interlace = 0;
       else if (strcmp(var.value, "enabled") == 0)
          pl_rearmed_cbs.gpu_neon.allow_interlace = 1;
-      else
+      else // auto
          pl_rearmed_cbs.gpu_neon.allow_interlace = 2;
    }
 
@@ -2450,6 +2572,8 @@ static void update_variables(bool in_flight)
    }
 #endif
 
+   //
+   // CPU emulation related config
 #ifndef DRC_DISABLE
    var.value = NULL;
    var.key = "pcsx_rearmed_drc";
@@ -2503,6 +2627,7 @@ static void update_variables(bool in_flight)
          ndrc_g.hacks |= NDHACK_THREAD_FORCE;
       else if (strcmp(var.value, "enabled") == 0)
          ndrc_g.hacks |= NDHACK_THREAD_FORCE | NDHACK_THREAD_FORCE_ON;
+      // psxCpu->ApplyConfig(); will start/stop the thread
    }
 #endif
 
@@ -2589,6 +2714,9 @@ static void update_variables(bool in_flight)
 
    psxCpu->ApplyConfig();
 
+   // end of CPU emu config
+   //
+
    var.value = NULL;
    var.key = "pcsx_rearmed_spu_reverb";
 
@@ -2658,7 +2786,7 @@ static void update_variables(bool in_flight)
          Config.GpuListWalking = 0;
       else if (strcmp(var.value, "enabled") == 0)
          Config.GpuListWalking = 1;
-      else
+      else // auto
          Config.GpuListWalking = -1;
    }
 
@@ -2670,7 +2798,7 @@ static void update_variables(bool in_flight)
          Config.FractionalFramerate = 0;
       else if (strcmp(var.value, "enabled") == 0)
          Config.FractionalFramerate = 1;
-      else
+      else // auto
          Config.FractionalFramerate = -1;
    }
 
@@ -2682,7 +2810,7 @@ static void update_variables(bool in_flight)
          Config.AlternativeFlip = 1;
       else if (strcmp(var.value, "late") == 0)
          Config.AlternativeFlip = 0;
-      else
+      else // auto
          Config.AlternativeFlip = -1;
    }
 
@@ -2696,7 +2824,7 @@ static void update_variables(bool in_flight)
          pl_rearmed_cbs.screen_centering_type = 2;
       else if (strcmp(var.value, "manual") == 0)
          pl_rearmed_cbs.screen_centering_type = 3;
-      else
+      else // auto
          pl_rearmed_cbs.screen_centering_type = 0;
    }
 
@@ -2755,7 +2883,7 @@ static void update_variables(bool in_flight)
       else if (strcmp(var.value, "disabled") == 0)
          pl_rearmed_cbs.thread_rendering = 0;
       else
-         pl_rearmed_cbs.thread_rendering = -1;
+         pl_rearmed_cbs.thread_rendering = -1; // auto
    }
 #endif
 
@@ -2837,6 +2965,10 @@ static void update_variables(bool in_flight)
 #endif
 
 #ifdef GPU_UNAI
+   /* Note: This used to be an option, but it only works
+    * (correctly) when running high resolution games
+    * (480i, 512i) and has been obsoleted by
+    * pcsx_rearmed_scale_hires */
    pl_rearmed_cbs.gpu_unai.ilace_force = 0;
 
    var.key = "pcsx_rearmed_gpu_unai_old_renderer";
@@ -2929,6 +3061,9 @@ static void update_variables(bool in_flight)
          in_enable_crosshair[1] = 0xFFFF;
    }
 
+   //This adjustment process gives the user the ability to manually align the mouse up better
+   //with where the shots are in the emulator.
+
    var.value = NULL;
    var.key = "pcsx_rearmed_konamigunadjustx";
 
@@ -2995,6 +3130,7 @@ static void update_variables(bool in_flight)
 
    if (in_flight)
    {
+      // inform core things about possible config changes
       plugin_call_rearmed_cbs();
 
       if (GPU_open != NULL && GPU_close != NULL)
@@ -3003,8 +3139,11 @@ static void update_variables(bool in_flight)
          GPU_open(&gpuDisp, "PCSX", NULL);
       }
 
+      /* Reinitialise frameskipping, if required */
       if (((frameskip_type     != prev_frameskip_type)))
          retro_set_audio_buff_status_cb();
+
+      /* dfinput_activate(); */
    }
 
    update_option_visibility();
@@ -3017,8 +3156,13 @@ static void update_variables(bool in_flight)
    }
 }
 
+// Taken from beetle-psx-libretro
 static uint16_t get_analog_button(int16_t ret, retro_input_state_t input_state_cb, int player_index, int id)
 {
+   // NOTE: Analog buttons were added Nov 2017. Not all front-ends support this
+   // feature (or pre-date it) so we need to handle this in a graceful way.
+
+   // First, try and get an analog value using the new libretro API constant
    uint16_t button = input_state_cb(player_index,
        RETRO_DEVICE_ANALOG,
        RETRO_DEVICE_INDEX_ANALOG_BUTTON,
@@ -3027,6 +3171,12 @@ static uint16_t get_analog_button(int16_t ret, retro_input_state_t input_state_c
 
    if (button == 0)
    {
+      // If we got exactly zero, we're either not pressing the button, or the front-end
+      // is not reporting analog values. We need to do a second check using the classic
+      // digital API method, to at least get some response - better than nothing.
+
+      // NOTE: If we're really just not holding the button, we're still going to get zero.
+
       button = (ret & (1 << id)) ? 255 : 0;
    }
 
@@ -3052,9 +3202,18 @@ static unsigned char axis_range_modifier(int axis_value, bool is_square)
 
 static void update_input_guncon(int port, int ret)
 {
+   //ToDo:
+   //Separate pointer and lightgun control types
+
+   //Mouse range is -32767 -> 32767
+   //1% is about 655
+   //Use the left analog stick field to store the absolute coordinates
+
    int gunx = input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X);
    int guny = input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y);
 
+   //Have the Libretro API let /libpcsxcore/plugins.c know when the lightgun is pointed offscreen
+   //Offscreen value is chosen to be well out of range of any possible scaling done via core options
    if (input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN) || input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_RELOAD))
    {
       in_analog_left[port][0] = 65536;
@@ -3066,26 +3225,43 @@ static void update_input_guncon(int port, int ret)
       in_analog_left[port][1] = ((guny * GunconAdjustRatioY) + (GunconAdjustY * 655)) / 64 + 512;
    }
 	
+   //GUNCON has 3 controls, Trigger,A,B which equal Circle,Start,Cross
+
+   // Trigger
    if (input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_TRIGGER) || input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_RELOAD))
       in_keystate[port] |= (1 << DKEY_CIRCLE);
 
+   // A
    if (input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_A))
       in_keystate[port] |= (1 << DKEY_START);
 
+   // B
    if (input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_B))
       in_keystate[port] |= (1 << DKEY_CROSS);
+	   
 }
 
 static void update_input_justifier(int port, int ret)
 {
+   //ToDo:
+   //Separate pointer and lightgun control types
+
+   //RetroArch lightgun range is -32767 -> 32767 on both axes (positive Y is down)
+
+   //JUSTIFIER has 3 controls, Trigger,Special,Start which equal Square,Cross,Start
+
+   // Trigger
    if (input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_TRIGGER) || input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_RELOAD))
       in_keystate[port] |= (1 << DKEY_SQUARE);
 
+   // Special
    if (input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_A))
       in_keystate[port] |= (1 << DKEY_CROSS);
 
+   // Start
    if (input_state_cb(port, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_START))
       in_keystate[port] |= (1 << DKEY_START);
+	   
 }
 
 static void update_input_negcon(int port, int ret)
@@ -3096,23 +3272,44 @@ static void update_input_negcon(int port, int ret)
    int negcon_ii_rs;
    float negcon_twist_amplitude;
 
+   // Query digital inputs
+   //
+   // > Pad-Up
    if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_UP))
       in_keystate[port] |= (1 << DKEY_UP);
+   // > Pad-Right
    if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT))
       in_keystate[port] |= (1 << DKEY_RIGHT);
+   // > Pad-Down
    if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_DOWN))
       in_keystate[port] |= (1 << DKEY_DOWN);
+   // > Pad-Left
    if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_LEFT))
       in_keystate[port] |= (1 << DKEY_LEFT);
+   // > Start
    if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_START))
       in_keystate[port] |= (1 << DKEY_START);
+   // > neGcon A
    if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_A))
       in_keystate[port] |= (1 << DKEY_CIRCLE);
+   // > neGcon B
    if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_X))
       in_keystate[port] |= (1 << DKEY_TRIANGLE);
+   // > neGcon R shoulder (digital)
    if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_R))
       in_keystate[port] |= (1 << DKEY_R1);
-
+   // Query analog inputs
+   //
+   // From studying 'libpcsxcore/plugins.c' and 'frontend/plugin.c':
+   // >> pad->leftJoyX  == in_analog_left[port][0]  == NeGcon II
+   // >> pad->leftJoyY  == in_analog_left[port][1]  == NeGcon L
+   // >> pad->rightJoyX == in_analog_right[port][0] == NeGcon twist
+   // >> pad->rightJoyY == in_analog_right[port][1] == NeGcon I
+   // So we just have to map in_analog_left/right to more
+   // appropriate inputs...
+   //
+   // > NeGcon twist
+   // >> Get raw analog stick value and account for deadzone
    lsx = input_state_cb(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
    if (lsx > negcon_deadzone)
       lsx = lsx - negcon_deadzone;
@@ -3120,7 +3317,7 @@ static void update_input_negcon(int port, int ret)
       lsx = lsx + negcon_deadzone;
    else
       lsx = 0;
-
+   // >> Convert to an 'amplitude' [-1.0,1.0] and adjust response
    negcon_twist_amplitude = (float)lsx / (float)(NEGCON_RANGE - negcon_deadzone);
    if (negcon_linearity == 2)
    {
@@ -3131,18 +3328,26 @@ static void update_input_negcon(int port, int ret)
    }
    else if (negcon_linearity == 3)
       negcon_twist_amplitude = negcon_twist_amplitude * negcon_twist_amplitude * negcon_twist_amplitude;
-
+   // >> Convert to final 'in_analog' integer value [0,255]
    in_analog_right[port][0] = MAX(MIN((int)(negcon_twist_amplitude * 128.0f) + 128, 255), 0);
-
+   // > NeGcon I + II
+   // >> Handle right analog stick vertical axis mapping...
+   //    - Up (-Y) == accelerate == neGcon I
+   //    - Down (+Y) == brake == neGcon II
    negcon_i_rs = 0;
    negcon_ii_rs = 0;
    rsy = input_state_cb(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
    if (rsy >= 0)
    {
+      // Account for deadzone
+      // (Note: have never encountered a gamepad with significant differences
+      // in deadzone between left/right analog sticks, so use the regular 'twist'
+      // deadzone here)
       if (rsy > negcon_deadzone)
          rsy = rsy - negcon_deadzone;
       else
          rsy = 0;
+      // Convert to 'in_analog' integer value [0,255]
       negcon_ii_rs = MIN((int)(((float)rsy / (float)(NEGCON_RANGE - negcon_deadzone)) * 255.0f), 255);
    }
    else
@@ -3153,19 +3358,19 @@ static void update_input_negcon(int port, int ret)
          rsy = 0;
       negcon_i_rs = MIN((int)(((float)rsy / (float)(NEGCON_RANGE - negcon_deadzone)) * 255.0f), 255);
    }
-
+   // >> NeGcon I
    in_analog_right[port][1] = MAX(
        MAX(
            get_analog_button(ret, input_state_cb, port, RETRO_DEVICE_ID_JOYPAD_R2),
            get_analog_button(ret, input_state_cb, port, RETRO_DEVICE_ID_JOYPAD_B)),
        negcon_i_rs);
-
+   // >> NeGcon II
    in_analog_left[port][0] = MAX(
        MAX(
            get_analog_button(ret, input_state_cb, port, RETRO_DEVICE_ID_JOYPAD_L2),
            get_analog_button(ret, input_state_cb, port, RETRO_DEVICE_ID_JOYPAD_Y)),
        negcon_ii_rs);
-
+   // > NeGcon L
    in_analog_left[port][1] = get_analog_button(ret, input_state_cb, port, RETRO_DEVICE_ID_JOYPAD_L);
 }
 
@@ -3183,12 +3388,14 @@ static void update_input_mouse(int port, int ret)
    if (y > 127) y = 127;
    else if (y < -128) y = -128;
 
-   in_mouse[port][0] = x;
-   in_mouse[port][1] = y;
+   in_mouse[port][0] = x; /* -128..+128 left/right movement, 0 = no movement */
+   in_mouse[port][1] = y; /* -128..+128 down/up movement, 0 = no movement    */
 
+   /* left mouse button state */
    if (input_state_cb(port, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
       in_keystate[port] |= 1 << 11;
 
+   /* right mouse button state */
    if (input_state_cb(port, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
       in_keystate[port] |= 1 << 10;
 }
@@ -3198,6 +3405,7 @@ static void update_input(void)
    int i;
    int j;
 
+   // reset all keystate, query libretro for keystate
    for (i = 0; i < PORTS_NUMBER; i++)
    {
       int32_t ret = 0;
@@ -3211,6 +3419,7 @@ static void update_input(void)
       if (libretro_supports_bitmasks)
       {
          ret = input_state_cb(i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+         // undo int16 sign extension (why input_state_cb returns int16 in the first place?)
          ret &= (1 << (RETRO_DEVICE_ID_JOYPAD_R3 + 1)) - 1;
       }
       else
@@ -3237,6 +3446,7 @@ static void update_input(void)
          update_input_mouse(i, ret);
          break;      
       default:
+         // dualshock ANALOG toggle?
          if (type == PSE_PAD_TYPE_ANALOGPAD && in_dualshock_analog_combo != 0
              && ret == in_dualshock_analog_combo)
          {
@@ -3252,10 +3462,12 @@ static void update_input(void)
          }
          in_dualshock_toggling = false;
 
+         // Set digital inputs
          for (j = 0; j < RETRO_PSX_MAP_LEN; j++)
             if (ret & (1 << j))
                in_keystate[i] |= retro_psx_map[j];
 
+         // Query analog inputs
          if (type == PSE_PAD_TYPE_ANALOGJOY || type == PSE_PAD_TYPE_ANALOGPAD)
          {
             in_analog_left[i][0]  = axis_range_modifier(input_state_cb(i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X), axis_bounds_modifier);
@@ -3339,7 +3551,10 @@ static void print_internal_fps(void)
 static bool get_bios_config_hle(void);
 static void prepare_bios(bool use_hle);
 
-/* ---- stereo3d section ---- */
+/* ---- stereo3d section ----
+ * Packs the finished frame as [left eye | right eye] side by side and tells
+ * the frontend where each eye is. Each eye is shifted by per-pixel depth
+ * (draw order rank from the Unai GPU plugin). */
 static bool stereo_wanted(void)
 {
    unsigned status = 0;
@@ -3383,6 +3598,8 @@ static void stereo_clear_map(void)
    SysPrintf("stereo3d: views map cleared\n");
 }
 
+/* Tells the user what the stereo code is doing; every message starts with
+ * "STEREO v6" so it is obvious that this modified core is the one running. */
 static void stereo_status(int code, const char *txt)
 {
    static int last = -1;
@@ -3392,118 +3609,77 @@ static void stereo_status(int code, const char *txt)
    show_notification(txt, 5000, 2, RETRO_LOG_INFO);
 }
 
-#define STEREO_STRENGTH_PX 12
-
-#define STEREO_BUILD_ROWS(T) do { \
-   const T *s_ = (const T *)src; \
-   T *dl_ = (T *)dst; \
-   T *dr_ = (T *)(dst + row_b); \
-   stereo_cs[0] = 0; \
-   for (xo = 0; xo < we; xo++) { \
-      int sx_ = (xo * xstep) >> 16, h_ = 0, ui_ = 0, dz_ = 0; \
-      if (drow) { \
-         int vx_ = sx_ - vout_img_x; \
-         if ((unsigned)vx_ < (unsigned)vout_img_w) { \
-            dz_ = drow[(dx0 + vx_) & 1023]; \
-            if (dz_ == 65535 || dz_ == 0) ui_ = 1; \
-            else { \
-               int sz_ = 65535 - dz_; \
-               if (sz_ < 128) sz_ = 128; \
-               int disp_ = (262144 / sz_) - 256; \
-               if (disp_ > 256) disp_ = 256; \
-               if (disp_ < -256) disp_ = -256; \
-               h_ = (disp_ * strength * 8) >> 9; \
-            } \
-         } \
-      } \
-      stereo_z[xo] = dz_; stereo_h[xo] = h_; stereo_ui[xo] = ui_; \
-      stereo_cs[xo + 1] = stereo_cs[xo] + h_; \
-      stereo_zl[xo] = -1; stereo_zr[xo] = -1; \
-      stereo_fl[xo] = 0; stereo_fr[xo] = 0; \
-   } \
-   for (xo = 0; xo < we; xo++) { \
-      int lo_ = xo - 4 < 0 ? 0 : xo - 4, hi_ = xo + 5 > we ? we : xo + 5; \
-      int hs_ = ((stereo_cs[hi_] - stereo_cs[lo_]) * stereo_rcp9[hi_ - lo_]) >> 16; \
-      int hf_ = 0; \
-      if (!stereo_ui[xo]) { \
-         hf_ = first_row ? hs_ : (hs_ + 3 * stereo_hprev[xo]) >> 2; \
-         stereo_hprev[xo] = hf_; \
-      } \
-      stereo_h[xo] = hf_; \
-   } \
-   first_row = 0; \
-   for (xo = 0; xo < we; xo++) { \
-      int sx_ = (xo * xstep) >> 16, dz_ = stereo_z[xo], hh_ = stereo_h[xo], half_, xl_, xr_; \
-      T pix_ = s_[sx_]; \
-      half_ = hh_ >= 0 ? (hh_ + 4) >> 3 : -((-hh_ + 4) >> 3); \
-      xl_ = xo + half_; xr_ = xo - half_; \
-      if ((unsigned)xl_ < (unsigned)we && dz_ >= stereo_zl[xl_]) { dl_[xl_] = pix_; stereo_zl[xl_] = dz_; stereo_fl[xl_] = 1; } \
-      if ((unsigned)xr_ < (unsigned)we && dz_ >= stereo_zr[xr_]) { dr_[xr_] = pix_; stereo_zr[xr_] = dz_; stereo_fr[xr_] = 1; } \
-   } \
-   for (xo = 0; xo < we; xo++) \
-      if (!stereo_fl[xo]) dl_[xo] = xo ? dl_[xo - 1] : s_[0]; \
-   for (xo = we - 1; xo >= 0; xo--) \
-      if (!stereo_fr[xo]) dr_[xo] = (xo < we - 1) ? dr_[xo + 1] : s_[w - 1]; \
-} while (0)
+/* Strength of the effect: total horizontal distance, in pixels of the
+ * 320 px wide picture, between the left and right image of the farthest
+ * and of the nearest object. Raise for a stronger 3D effect. */
+#define STEREO_MAX_SHIFT_PX 10
 
 static bool stereo_present(void)
 {
 #ifdef _3DS
    int bytes_pp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
-   int w = vout_width, we, xstep, rcp, strength, row_b, y, xo, first_row = 1;
-   const unsigned char *src = vout_buf_ptr;
+   int w = vout_width, we, xstep, row_b, y, xo;
+   const unsigned char *src_l = vout_buf_ptr;
+   const unsigned char *src_r = vout_buf_r ? (const unsigned char *)vout_buf_r : (const unsigned char *)vout_buf_ptr;
    unsigned char *dst = stereo_buf;
-   unsigned dn = gpu_unai_depth_disp_n ? gpu_unai_depth_disp_n : 1;
-   int dx0 = gpu_unai_depth_disp_x;
 
    if (!stereo_wanted()) {
-      stereo_status(0, "STEREO GTE: 3D off (set 3DS Display Mode = 3D, raise slider)");
+      stereo_status(0, "STEREO MODE2: 3D off (enable 3DS 3D mode & raise slider)");
       stereo_clear_map();
       return false;
    }
-   if (!stereo_buf || !src || !gpu_unai_depth) {
-      stereo_status(1, "STEREO GTE: no depth buffer");
+   if (!stereo_buf || !src_l || !gpu_unai_vram_r) {
+      stereo_status(1, "STEREO MODE2: no right-eye buffer");
       stereo_clear_map();
       return false;
    }
    we = w > 320 ? 320 : w;
    if (!vout_img_ok || w <= 0 || vout_height <= 0 || we * 2 > VOUT_MAX_WIDTH) {
-      static char msg[96];
-      snprintf(msg, sizeof(msg),
-         "STEREO GTE: 3D unavailable (w=%d ok=%d)", w, vout_img_ok);
-      stereo_status(2, msg);
       stereo_clear_map();
       return false;
    }
-   xstep = (w << 16) / we;
-   {
-      static unsigned dn_smooth;
-      dn_smooth = dn_smooth ? (dn_smooth * 7 + dn) / 8 : dn;
-      dn = dn_smooth ? dn_smooth : 1;
-   }
-   rcp = (256 << 16) / (int)dn;
-   strength = (int)(STEREO_STRENGTH_PX * osGet3DSliderState() + 0.5f);
-   if (strength < 0) strength = 0;
 
    row_b = we * bytes_pp;
-   for (y = 0; y < vout_height; y++) {
-      const unsigned short *drow = NULL;
-      int iy = y - vout_img_y;
-
-      if (iy >= 0 && iy < vout_img_h)
-         drow = gpu_unai_depth + (((gpu_unai_depth_disp_y + iy) & 511) << 10);
-
-      if (bytes_pp == 4)
-         STEREO_BUILD_ROWS(unsigned int);
-      else
-         STEREO_BUILD_ROWS(unsigned short);
-
-      src += vout_pitch_b;
-      dst += row_b * 2;
+   if (we == w) {
+      for (y = 0; y < vout_height; y++) {
+         memcpy(dst, src_l, row_b);
+         memcpy(dst + row_b, src_r, row_b);
+         src_l += vout_pitch_b;
+         src_r += vout_pitch_b;
+         dst += row_b * 2;
+      }
+   } else {
+      xstep = (w << 16) / we;
+      for (y = 0; y < vout_height; y++) {
+         if (bytes_pp == 4) {
+            const unsigned int *sl = (const unsigned int *)src_l;
+            const unsigned int *sr = (const unsigned int *)src_r;
+            unsigned int *dl = (unsigned int *)dst;
+            unsigned int *dr = (unsigned int *)(dst + row_b);
+            for (xo = 0; xo < we; xo++) {
+               int sx = (xo * xstep) >> 16;
+               dl[xo] = sl[sx];
+               dr[xo] = sr[sx];
+            }
+         } else {
+            const unsigned short *sl = (const unsigned short *)src_l;
+            const unsigned short *sr = (const unsigned short *)src_r;
+            unsigned short *dl = (unsigned short *)dst;
+            unsigned short *dr = (unsigned short *)(dst + row_b);
+            for (xo = 0; xo < we; xo++) {
+               int sx = (xo * xstep) >> 16;
+               dl[xo] = sl[sx];
+               dr[xo] = sr[sx];
+            }
+         }
+         src_l += vout_pitch_b;
+         src_r += vout_pitch_b;
+         dst += row_b * 2;
+      }
    }
 
    stereo_send_map(we, vout_height);
-   stereo_status(3, "STEREO GTE: 3D ON");
+   stereo_status(3, "STEREO MODE2: True Geometry 3D ON");
    video_cb(stereo_buf, we * 2, vout_height, row_b * 2);
    return true;
 #else
@@ -3515,8 +3691,13 @@ static bool stereo_present(void)
 void retro_run(void)
 {
 #ifdef _3DS
-   gpu_unai_depth_on = stereo_wanted();
+   {
+      float slider = osGet3DSliderState();
+      gpu_unai_stereo_enabled = stereo_wanted() && (slider > 0.02f);
+      gpu_unai_stereo_strength = gpu_unai_stereo_enabled ? (int)(slider * STEREO_MAX_SHIFT_PX + 0.5f) : 0;
+   }
 #endif
+   //SysReset must be run while core is running,Not in menu (Locks up Retroarch)
    if (reset_pending)
    {
       reset_pending = false;
@@ -3531,6 +3712,7 @@ void retro_run(void)
    set_vout_fb();
    print_internal_fps();
 
+   /* Check whether current frame should be skipped */
    if (frameskip_type != FRAMESKIP_NONE && !pl_rearmed_cbs.fskip_force &&
        frameskip_counter < frameskip_interval)
    {
@@ -3554,6 +3736,11 @@ void retro_run(void)
       pl_rearmed_cbs.fskip_force = skip_frame;
    }
 
+   /* If frameskip/timing settings have changed,
+    * update frontend audio latency
+    * > Can do this before or after the frameskip
+    *   check, but doing it after means we at least
+    *   retain the current frame's audio output */
    if (update_audio_latency)
    {
       environ_cb(RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY,
@@ -3599,6 +3786,7 @@ void retro_run(void)
 #endif
 }
 
+// see Config.Bios
 static char *bios_saved[PSX_REGION_COUNT];
 
 static bool have_all_bios(void)
@@ -3685,6 +3873,9 @@ finish:
 
 #ifndef VITA
 #ifdef USE_LIBRETRO_VFS
+/**
+ * Finds a given bios by using libretro-common's readdir().
+ */
 static void find_any_bios(const char *dirpath, char *path, size_t path_size)
 {
    struct RDIR *dir;
@@ -3749,6 +3940,8 @@ static void init_memcards(void)
    snprintf(Config.Mcd2, sizeof(Config.Mcd2), "none");
    init_memcard(Mcd1Data);
    init_memcard(Mcd2Data);
+
+   // we'll do the actual loading after the game's serial is known
 }
 
 static void get_dash_serial(char *dst, size_t size)
@@ -3895,6 +4088,7 @@ static void loadPSXBios(void)
    {
       msg_str = "BIOS set to \'hle\'";
       SysPrintf("Using HLE BIOS.\n");
+      // shorter as the user probably intentionally wants to use HLE
       duration = 700;
    }
    else if (!bios_saved[0] && !bios_saved[1] && !bios_saved[2])
@@ -3920,7 +4114,8 @@ void retro_init(void)
    environ_cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION, &msg_interface_version);
 
 #if defined(__MACH__) && !defined(TVOS)
-   syscall(SYS_ptrace, 0, 0, 0, 0);
+   // magic sauce to make the dynarec work on iOS
+   syscall(SYS_ptrace, 0 /*PTRACE_TRACEME*/, 0, 0, 0);
 #endif
 
 #if defined(_3DS)
@@ -3937,6 +4132,7 @@ void retro_init(void)
 #endif
    ret = emu_core_preinit();
 #ifdef _3DS
+   /* emu_core_preinit sets the cpu to dynarec */
    if (!__ctr_svchax)
       Config.Cpu = CPU_INTERPRETER;
 #endif
@@ -3949,8 +4145,12 @@ void retro_init(void)
       exit(1);
    }
 
+   // alloc enough for RETRO_PIXEL_FORMAT_XRGB8888
    size_t vout_buf_size = VOUT_MAX_WIDTH * VOUT_MAX_HEIGHT * 4;
 #ifdef _3DS
+   // Place psx vram in linear mem to take advantage of its supersection mapping.
+   // The emu allocs 2x (0x201000 to be exact) but doesn't really need that much,
+   // so place vout_buf below to also act as an overdraw guard.
    vram_mem = linearMemAlign(1024*1024 + 4096 + vout_buf_size, 4096);
    if (vram_mem) {
       vout_buf = (char *)vram_mem + 1024*1024 + 4096;
@@ -3969,6 +4169,7 @@ void retro_init(void)
    if (vout_buf == NULL)
    {
       LogErr("OOM for vout_buf.\n");
+      // may be able to continue if we get retro_framebuffer access
    }
 
    vout_buf_ptr = vout_buf;
@@ -3976,6 +4177,9 @@ void retro_init(void)
    stereo_buf = malloc(vout_buf_size);
    if (stereo_buf)
       memset(stereo_buf, 0, vout_buf_size);
+   vout_buf_r = malloc(vout_buf_size);
+   if (vout_buf_r)
+      memset(vout_buf_r, 0, vout_buf_size);
 
    loadPSXBios();
 
@@ -4021,6 +4225,8 @@ void retro_deinit(void)
    vout_buf = NULL;
    free(stereo_buf);
    stereo_buf = NULL;
+   free(vout_buf_r);
+   vout_buf_r = NULL;
    stereo_map_sent = false;
 
 #ifdef VITA
@@ -4041,6 +4247,8 @@ void retro_deinit(void)
       bios_saved[i] = NULL;
    }
 
+   /* Have to reset disks struct, otherwise
+    * fnames/flabels will leak memory */
    disk_init();
    frameskip_type             = FRAMESKIP_NONE;
    frameskip_threshold        = 0;
@@ -4066,6 +4274,7 @@ void SysPrintf(const char *fmt, ...)
       log_cb(RETRO_LOG_INFO, "%s", msg);
 }
 
+/* Prints debug-level logs */
 void SysDLog(const char *fmt, ...)
 {
    va_list list;
@@ -4078,3 +4287,5 @@ void SysDLog(const char *fmt, ...)
    if (log_cb)
       log_cb(RETRO_LOG_DEBUG, "%s", msg);
 }
+
+// vim:sw=3:ts=3:expandtab
