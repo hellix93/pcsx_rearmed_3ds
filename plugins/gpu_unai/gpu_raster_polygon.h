@@ -64,13 +64,7 @@ enum PolyType {
 // polyInitVertexBuffer()
 // Fills vbuf[] array with data from any type of poly draw-command packet.
 ///////////////////////////////////////////////////////////////////////////////
-extern "C" {
-extern unsigned short gte_z_cache[65536];
-}
-static inline unsigned short gte_zcache_lookup(short x, short y) {
-	unsigned int sxy = ((unsigned int)(unsigned short)y << 16) | (unsigned short)x;
-	return gte_z_cache[(unsigned short)((sxy ^ (sxy >> 16) ^ (sxy >> 7)) & 0xFFFF)];
-}
+#include "../../libpcsxcore/gte.h"
 
 static inline s32 gpu_stereo_calc_vertex_shift(s32 x, s32 y)
 {
