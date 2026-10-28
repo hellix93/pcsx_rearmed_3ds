@@ -424,134 +424,44 @@ static inline bool ProgressiveInterlaceEnabled()
 }
 
 
-// ---------------------------------------------------------------------
-// Stereo 3D mod: per-pixel "draw order rank" map used by the frontend to
-// build left/right eye images. A primitive's rank = its index among the
-// primitives drawn since the display area last changed (later = closer).
-// Only pixels that a primitive really changed get its rank, so transparent
-// texels do not receive a wrong depth.
-// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Stereo 3D mod ("dual pass"): every drawing command list is rasterized twice,
+// once per eye. In 3D polygons each vertex is moved sideways by an amount that
+// depends on its real depth (taken from the GTE), 2D things are drawn
+// identically in both eyes. The right eye is drawn into its own frame buffer
+// (same size and layout as VRAM); textures are always read from the main VRAM.
+// ---------------------------------------------------------------------------
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern unsigned short *gpu_unai_depth;      // 1024x512, one entry per VRAM pixel
-extern int gpu_unai_depth_on;               // set by frontend when stereo is active
-extern unsigned gpu_unai_depth_cur;         // rank of the primitive being drawn
-extern int gpu_unai_depth_disp_x;           // displayed area origin in VRAM
-extern int gpu_unai_depth_disp_y;
-extern unsigned gpu_unai_depth_disp_n;      // number of primitives in displayed frame
-// Real vertex depth taken from the GTE (hooked in the dynarec): see gpulib_if.cpp
+extern unsigned short *gpu_unai_vram_r;   // right-eye buffer, 1024x512 (set by frontend)
+extern int gpu_unai_stereo_on;            // frontend: stereo is wanted right now
+extern int gpu_unai_stereo_resync;        // frontend: copy main VRAM to right buffer
+extern int gpu_unai_stereo_strength;      // frontend: shift range in pixels (slider scaled)
+extern int gpu_unai_stereo_vfar;          // depth scale of the current scene
+extern int gpu_unai_stereo_rcpn;
+extern int gpu_unai_eye;                  // 0 = normal, +1 = left eye pass, -1 = right eye pass
 void gpu_unai_depth_record_rtps(const unsigned int *cp2d);
 void gpu_unai_depth_record_rtpt(const unsigned int *cp2d);
-extern unsigned gpu_unai_zrec;              // vertices recorded from the GTE
-extern unsigned gpu_unai_zhit;              // polygon vertices whose depth was found
-extern unsigned gpu_unai_zmiss;             // polygon vertices without depth
+void gpu_unai_stereo_scale_update(void);
+extern unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
 #ifdef __cplusplus
 }
 #endif
 
-// Depth value stored per pixel: v = 65534 * 64 / z (so larger = nearer, linear
-// in screen space); 0 = untouched, 65535 = 2D/HUD.
-struct gpu_dplane_t {
-	s32 v0_8, dvdx_8, dvdy_8;   // value at (xr,yr) and slopes, 24.8 fixed point
-	s32 xr, yr;
-	bool ui;                    // polygon without GTE depth: 2D element
-};
-extern gpu_dplane_t gpu_dplane;
-extern unsigned gpu_depth_lastv;
+// destination of drawing: right eye pass draws into the right-eye buffer
+#define GPU_DST_VRAM ((gpu_unai_eye < 0) ? (le16_t *)gpu_unai_vram_r : gpu_unai.vram)
+
 int gpu_depth_lookup(u32 key);
-void gpu_depth_set_plane(int v0, int x0, int y0, int v1, int x1, int y1, int v2, int x2, int y2);
 
-#define GPU_DEPTH_TMP_PIXELS (256 * 256)
-extern u16 gpu_depth_tmp[GPU_DEPTH_TMP_PIXELS];
-
-static inline u16 gpu_depth_rank(void)
+// sideways shift (pixels) of a vertex with depth value v for the current eye
+static inline int gpu_stereo_shift(int v)
 {
-	return gpu_unai_depth_cur > 65535u ? 65535u : (u16)gpu_unai_depth_cur;
+	int n = ((v - gpu_unai_stereo_vfar) * gpu_unai_stereo_rcpn) >> 16;
+	if (n < 0) n = 0; else if (n > 256) n = 256;
+	int h = ((n - 128) * gpu_unai_stereo_strength * 8) >> 9;      // 1/8 pixel
+	int half = h >= 0 ? (h + 4) >> 3 : -((-h + 4) >> 3);
+	return gpu_unai_eye * half;
 }
-
-static inline void gpu_depth_snap(const le16_t *p, int w, int h)
-{
-	if (w * h > GPU_DEPTH_TMP_PIXELS) return;
-	for (int y = 0; y < h; y++)
-		memcpy(&gpu_depth_tmp[y * w], p + (y << 10), w * 2);
-}
-
-#define GPU_DEPTH_UI 65535   // reserved value (not produced any more)
-
-// semi-transparent primitives (shadows, glass, menu overlays) keep the depth
-// of what lies under them
-static inline bool gpu_prim_semitrans(void)
-{
-	return (gpu_unai.PacketBuffer.U1[3] & 2) != 0;   // command byte, bit 1 = semi-transparent
-}
-
-static inline void gpu_depth_diff(const le16_t *p, int w, int h, u16 r)
-{
-	u16 *d = gpu_unai_depth + (p - gpu_unai.vram);
-	if (w * h > GPU_DEPTH_TMP_PIXELS) {      // too big to compare: tag all
-		for (int y = 0; y < h; y++)
-			for (int x = 0; x < w; x++)
-				d[(y << 10) + x] = r;
-		return;
-	}
-	for (int y = 0; y < h; y++) {
-		const u16 *row = (const u16 *)(p + (y << 10));   // raw compare, le16_t is a struct
-		const u16 *old = &gpu_depth_tmp[y * w];
-		u16 *drow = d + (y << 10);
-		for (int x = 0; x < w; x++)
-			if (row[x] != old[x]) drow[x] = r;
-	}
-}
-
-static inline void gpu_depth_clear_rect(int x, int y, int w, int h)
-{
-	if (!gpu_unai_depth) return;
-	if (x < 0) x = 0;
-	if (w > 1024 - x) w = 1024 - x;
-	for (int i = 0; i < h; i++)
-		memset(gpu_unai_depth + (((y + i) & 511) << 10) + x, 0, w * 2);
-}
-
-// tag changed pixels with the depth of the current polygon plane
-static inline void gpu_depth_diff_plane(const le16_t *p, int w)
-{
-	u16 *d = gpu_unai_depth + (p - gpu_unai.vram);
-	const u16 *row = (const u16 *)p;
-	const u16 *old = gpu_depth_tmp;
-	if (gpu_dplane.ui) {
-		for (int x = 0; x < w; x++)
-			if (row[x] != old[x]) d[x] = GPU_DEPTH_UI;
-		return;
-	}
-	int idx = p - gpu_unai.vram;
-	s32 v8 = gpu_dplane.v0_8 + gpu_dplane.dvdx_8 * ((idx & 1023) - gpu_dplane.xr)
-	       + gpu_dplane.dvdy_8 * ((idx >> 10) - gpu_dplane.yr);
-	for (int x = 0; x < w; x++, v8 += gpu_dplane.dvdx_8) {
-		if (row[x] != old[x]) {
-			s32 v = v8 >> 8;
-			d[x] = v < 1 ? 1 : (v > 65534 ? 65534 : (u16)v);
-		}
-	}
-}
-
-#define GPU_TAG_SPAN_Z(px, n, ...) do { \
-	if (gpu_unai_depth_on && gpu_unai_depth && !gpu_prim_semitrans()) { \
-		const le16_t *_tp = (px); int _tw = (n); \
-		gpu_depth_snap(_tp, _tw, 1); __VA_ARGS__; gpu_depth_diff_plane(_tp, _tw); \
-	} else { __VA_ARGS__; } } while (0)
-
-// draw call wrappers: run the draw call, then tag changed pixels
-#define GPU_TAG_RECT_R(rank, px, w, h, ...) do { \
-	if (gpu_unai_depth_on && gpu_unai_depth && !gpu_prim_semitrans()) { \
-		const le16_t *_tp = (px); int _tw = (w), _th = (h); \
-		gpu_depth_snap(_tp, _tw, _th); __VA_ARGS__; gpu_depth_diff(_tp, _tw, _th, (rank)); \
-	} else { __VA_ARGS__; } } while (0)
-#define GPU_TAG_RECT(px, w, h, ...) GPU_TAG_RECT_R(gpu_depth_rank(), px, w, h, __VA_ARGS__)
-// sprites/tiles have no depth of their own: they take the depth of the last 3D
-// polygon (so HUD and text sit in front of the scene, all at the same depth)
-#define GPU_TAG_RECT_LAST(px, w, h, ...) \
-	GPU_TAG_RECT_R((u16)(gpu_depth_lastv ? gpu_depth_lastv : 1), px, w, h, __VA_ARGS__)
-#define GPU_TAG_SPAN(px, n, ...) GPU_TAG_RECT(px, n, 1, __VA_ARGS__)
 
 #endif // GPU_UNAI_H

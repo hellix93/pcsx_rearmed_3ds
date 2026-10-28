@@ -60,43 +60,43 @@
 #define IS_OLD_RENDERER() false
 #endif
 
-unsigned short *gpu_unai_depth;
-int gpu_unai_depth_on;
-unsigned gpu_unai_depth_cur = 1;
-int gpu_unai_depth_disp_x, gpu_unai_depth_disp_y;
-unsigned gpu_unai_depth_disp_n = 1;
-u16 gpu_depth_tmp[GPU_DEPTH_TMP_PIXELS];
-gpu_dplane_t gpu_dplane;
-unsigned gpu_depth_lastv;
+// ----- stereo mod: globals, GTE depth cache, depth scale -----
+unsigned short *gpu_unai_vram_r;
+int gpu_unai_stereo_on, gpu_unai_stereo_resync, gpu_unai_stereo_strength;
+int gpu_unai_stereo_vfar, gpu_unai_stereo_rcpn = (256 << 16) / 65534;
+int gpu_unai_eye;
 unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
 
-// Cache "screen position of a vertex -> its depth", filled from the GTE
-// (RTPS/RTPT results) and read when the polygon packet arrives.
+// "screen position of a vertex -> its depth", filled from the GTE (RTPS/RTPT
+// results) and read when the polygon packet arrives. v = 65534*64/z, so
+// larger = nearer and v is linear in screen space.
 #define ZCACHE_BITS 14
 struct zcache_ent { u32 key; u32 v; };
 static zcache_ent zcache[1 << ZCACHE_BITS];
+static unsigned zhist[1024];
 static inline u32 zcache_idx(u32 key) { return (key * 2654435761u) >> (32 - ZCACHE_BITS); }
 
 static inline void zcache_put(u32 sxy, u32 sz)
 {
-  u32 v = sz ? (65534u * 64u) / sz : 65534u;     // nearer -> larger
+  u32 v = sz ? (65534u * 64u) / sz : 65534u;
   if (v > 65534u) v = 65534u;
   if (v < 1u) v = 1u;
   zcache_ent *e = &zcache[zcache_idx(sxy)];
   e->key = sxy;
   e->v = v;
+  zhist[v >> 6]++;
   gpu_unai_zrec++;
 }
 
 extern "C" void gpu_unai_depth_record_rtps(const unsigned int *cp2d)
 {
-  if (!gpu_unai_depth_on) return;
+  if (!gpu_unai_stereo_on) return;
   zcache_put(cp2d[14], cp2d[19] & 0xffff);
 }
 
 extern "C" void gpu_unai_depth_record_rtpt(const unsigned int *cp2d)
 {
-  if (!gpu_unai_depth_on) return;
+  if (!gpu_unai_stereo_on) return;
   zcache_put(cp2d[12], cp2d[17] & 0xffff);
   zcache_put(cp2d[13], cp2d[18] & 0xffff);
   zcache_put(cp2d[14], cp2d[19] & 0xffff);
@@ -105,52 +105,51 @@ extern "C" void gpu_unai_depth_record_rtpt(const unsigned int *cp2d)
 int gpu_depth_lookup(u32 key)
 {
   const zcache_ent *e = &zcache[zcache_idx(key)];
-  if (e->key == key && e->v) { gpu_unai_zhit++; return (int)e->v; }
-  gpu_unai_zmiss++;
+  if (e->key == key && e->v) {
+    if (gpu_unai_eye > 0) gpu_unai_zhit++;
+    return (int)e->v;
+  }
+  if (gpu_unai_eye > 0) gpu_unai_zmiss++;
   return -1;
 }
 
-void gpu_depth_set_plane(int v0, int x0, int y0, int v1, int x1, int y1, int v2, int x2, int y2)
+// Called by the frontend once per emulated frame: the 5% / 95% points of the
+// recently recorded depth values are mapped to far / near (smoothed in time).
+extern "C" void gpu_unai_stereo_scale_update(void)
 {
-  int known = 0, sum = 0;
-  if (v0 >= 0) { sum += v0; known++; }
-  if (v1 >= 0) { sum += v1; known++; }
-  if (v2 >= 0) { sum += v2; known++; }
-  if (!known) {                       // no GTE depth (2D element, clipped polygon):
-    gpu_dplane.ui = false;            // take the depth of the polygon drawn before it
-    gpu_dplane.xr = x0; gpu_dplane.yr = y0;
-    gpu_dplane.v0_8 = (gpu_depth_lastv ? gpu_depth_lastv : 1) << 8;
-    gpu_dplane.dvdx_8 = gpu_dplane.dvdy_8 = 0;
-    return;
-  }
-  int avg = sum / known;
-  gpu_dplane.ui = false;
-  gpu_depth_lastv = avg;
-  if (v0 < 0) v0 = avg;
-  if (v1 < 0) v1 = avg;
-  if (v2 < 0) v2 = avg;
+  static int vfar_s, vnear_s;
+  unsigned cnt = 0, acc, b, lo = 0, hi = 1023;
 
-  gpu_dplane.xr = x0; gpu_dplane.yr = y0;
-  gpu_dplane.v0_8 = v0 << 8;
-  float a = (float)((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0));
-  if (a > -1.0f && a < 1.0f) {        // degenerate: constant depth
-    gpu_dplane.v0_8 = avg << 8;
-    gpu_dplane.dvdx_8 = gpu_dplane.dvdy_8 = 0;
-    return;
+  for (b = 0; b < 1024; b++)
+    cnt += zhist[b];
+  if (cnt >= 50) {
+    int far_v, near_v;
+    for (b = 0, acc = 0; b < 1024; b++) {
+      acc += zhist[b];
+      if (acc * 100 >= cnt * 5) { lo = b; break; }
+    }
+    for (b = 0, acc = 0; b < 1024; b++) {
+      acc += zhist[b];
+      if (acc * 100 >= cnt * 95) { hi = b; break; }
+    }
+    far_v = (int)(lo << 6);
+    near_v = (int)((hi << 6) + 63);
+    if (near_v - far_v < 1024) {
+      int mid = (near_v + far_v) / 2;
+      far_v = mid - 512; near_v = mid + 512;
+    }
+    if (!vnear_s) { vfar_s = far_v; vnear_s = near_v; }
+    else { vfar_s = (vfar_s * 3 + far_v) >> 2; vnear_s = (vnear_s * 3 + near_v) >> 2; }
   }
-  float dvdx = ((float)(v1 - v0) * (y2 - y0) - (float)(v2 - v0) * (y1 - y0)) / a;
-  float dvdy = ((float)(x1 - x0) * (v2 - v0) - (float)(x2 - x0) * (v1 - v0)) / a;
-  if (dvdx > 2000.0f) dvdx = 2000.0f; else if (dvdx < -2000.0f) dvdx = -2000.0f;
-  if (dvdy > 2000.0f) dvdy = 2000.0f; else if (dvdy < -2000.0f) dvdy = -2000.0f;
-  gpu_dplane.dvdx_8 = (s32)(dvdx * 256.0f);
-  gpu_dplane.dvdy_8 = (s32)(dvdy * 256.0f);
+  for (b = 0; b < 1024; b++)
+    zhist[b] >>= 1;
+  if (!vnear_s) { vfar_s = 0; vnear_s = 65534; }
+  gpu_unai_stereo_vfar = vfar_s;
+  gpu_unai_stereo_rcpn = (256 << 16) / (vnear_s - vfar_s);
 }
 
 int renderer_init(void)
 {
-  if (!gpu_unai_depth)
-    gpu_unai_depth = (unsigned short *)calloc(1024 * 512, sizeof(unsigned short));
-  gpu_unai_depth_cur = 1;
   memset((void*)&gpu_unai, 0, sizeof(gpu_unai));
   gpu_unai.vram = (le16_t *)gpu.vram;
 
@@ -196,28 +195,10 @@ int renderer_init(void)
 
 void renderer_finish(void)
 {
-  free(gpu_unai_depth);
-  gpu_unai_depth = NULL;
 }
 
 void renderer_notify_screen_change(const struct psx_gpu_screen *screen)
 {
-  if (gpu_unai_depth_on && gpu_unai_depth
-      && (screen->src_x != gpu_unai_depth_disp_x
-          || screen->src_y != gpu_unai_depth_disp_y))
-  {
-    // frame just finished is now displayed: remember how many primitives it had
-    gpu_unai_depth_disp_n = gpu_unai_depth_cur > 1 ? gpu_unai_depth_cur - 1 : 1;
-    // the previously displayed buffer is where the next frame is drawn
-    gpu_depth_clear_rect(gpu_unai_depth_disp_x, gpu_unai_depth_disp_y,
-        screen->hres > 0 ? screen->hres : 320,
-        screen->vres > 0 ? screen->vres : 240);
-    gpu_unai_depth_disp_x = screen->src_x;
-    gpu_unai_depth_disp_y = screen->src_y;
-    gpu_unai_depth_cur = 1;
-    gpu_depth_lastv = 1;              // a new frame starts at the far end
-  }
-
   gpu_unai.inn.ilace_mask = gpu_unai.config.ilace_force;
 
   if (gpu.state.downscale_enable)
@@ -336,7 +317,7 @@ static inline void textured_sprite(int &cpu_cycles_sum, int &cpu_cycles)
 
 extern const unsigned char cmd_lengths[256];
 
-int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
+static int unai_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
  int *cycles_sum_out, int *cycles_last, int *last_cmd)
 {
   int cpu_cycles_sum = 0, cpu_cycles = *cycles_last;
@@ -358,9 +339,6 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
       cmd = -1;
       break;
     }
-
-    if (gpu_unai_depth_on && gpu_unai_depth_cur < 65535u)
-      gpu_unai_depth_cur++;
 
     #define PRIM cmd
     gpu_unai.PacketBuffer.U4[0] = list[0];
@@ -785,6 +763,43 @@ breakloop:
   return list - list_start;
 }
 
+// Dual pass: the same command list is drawn once for the left eye (main VRAM)
+// and once for the right eye (right-eye buffer), starting from the same
+// drawing state. Only the first pass reports timing and state to gpulib.
+int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
+ int *cycles_sum_out, int *cycles_last, int *last_cmd)
+{
+  static gpu_unai_t saved_state;
+  uint32_t ex2[8];
+  int ret, d_sum = 0, d_last = 0, d_cmd = 0;
+
+  if (!gpu_unai_stereo_on || !gpu_unai_vram_r || IS_OLD_RENDERER()) {
+    gpu_unai_eye = 0;
+    return unai_do_cmd_list(list_, list_len, ex_regs,
+             cycles_sum_out, cycles_last, last_cmd);
+  }
+
+  if (gpu_unai_stereo_resync) {
+    memcpy(gpu_unai_vram_r, (void *)gpu_unai.vram, FRAME_BUFFER_SIZE);
+    gpu_unai_stereo_resync = 0;
+  }
+
+  saved_state = gpu_unai;
+  memcpy(ex2, ex_regs, sizeof(ex2));
+
+  gpu_unai_eye = 1;
+  ret = unai_do_cmd_list(list_, list_len, ex_regs,
+          cycles_sum_out, cycles_last, last_cmd);
+
+  gpu_unai = saved_state;
+  d_last = *cycles_last;
+  gpu_unai_eye = -1;
+  unai_do_cmd_list(list_, list_len, ex2, &d_sum, &d_last, &d_cmd);
+
+  gpu_unai_eye = 0;
+  return ret;
+}
+
 void renderer_sync_ecmds(u32 *ecmds_)
 {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
@@ -805,6 +820,22 @@ void renderer_sync_ecmds(u32 *ecmds_)
 
 void renderer_update_caches(int x, int y, int w, int h, int state_changed)
 {
+  // CPU uploads and VRAM-to-VRAM copies must show up in the right-eye buffer too
+  if (!gpu_unai_stereo_on || !gpu_unai_vram_r)
+    return;
+  if (h > 512) h = 512;
+  if (w > 1024) w = 1024;
+  x &= 1023;
+  for (int i = 0; i < h; i++) {
+    int row = ((y + i) & 511) << 10;
+    if (x + w <= 1024) {
+      memcpy(gpu_unai_vram_r + row + x, (void *)(gpu_unai.vram + row + x), w * 2);
+    } else {
+      int w1 = 1024 - x;
+      memcpy(gpu_unai_vram_r + row + x, (void *)(gpu_unai.vram + row + x), w1 * 2);
+      memcpy(gpu_unai_vram_r + row, (void *)(gpu_unai.vram + row), (w - w1) * 2);
+    }
+  }
 }
 
 void renderer_flush_queues(void)

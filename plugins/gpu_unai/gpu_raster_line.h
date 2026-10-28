@@ -179,7 +179,7 @@ void gpuDrawLineF(PtrUnion packet, const PSD gpuPixelSpanDriver)
 	// Color to draw with (16 bits, highest of which is unset mask bit)
 	uintptr_t col16 = GPU_RGB16(le32_to_u32(packet.U4[0]));
 
-	le16_t *dst = gpu_unai.vram + (y0 * dst_stride + x0 * dst_depth) / FRAME_BYTES_PER_PIXEL;
+	le16_t *dst = GPU_DST_VRAM + (y0 * dst_stride + x0 * dst_depth) / FRAME_BYTES_PER_PIXEL;
 
 	// SPECIAL CASE: Vertical line
 	if (dx == 0) {
@@ -516,7 +516,7 @@ void gpuDrawLineG(PtrUnion packet, const PSD gpuPixelSpanDriver)
 	gcol.g = g0 << GPU_GOURAUD_FIXED_BITS;
 	gcol.b = b0 << GPU_GOURAUD_FIXED_BITS;
 
-	le16_t *dst = gpu_unai.vram + (y0 * dst_stride + x0 * dst_depth) / FRAME_BYTES_PER_PIXEL;
+	le16_t *dst = GPU_DST_VRAM + (y0 * dst_stride + x0 * dst_depth) / FRAME_BYTES_PER_PIXEL;
 
 	// SPECIAL CASE: Vertical line
 	if (dx == 0) {

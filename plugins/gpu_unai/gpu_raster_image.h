@@ -180,11 +180,8 @@ void gpuClearImage(PtrUnion packet)
 		fprintf(stdout,"gpuClearImage(x0=%d,y0=%d,w0=%d,h0=%d)\n",x0,y0,w0,h0);
 	#endif
 
-	if (gpu_unai_depth_on)
-		gpu_depth_clear_rect(x0, y0, w0, h0);
-
 	{
-		le32_t* pixel = (le32_t*)gpu_unai.vram + ((FRAME_OFFSET(x0, y0))>>1);
+		le32_t* pixel = (le32_t*)GPU_DST_VRAM + ((FRAME_OFFSET(x0, y0))>>1);
 		u32 _rgb = GPU_RGB16(le32_to_u32(packet.U4[0]));
 		le32_t rgb = u32_to_le32(_rgb | (_rgb << 16));
 #ifdef __arm__
