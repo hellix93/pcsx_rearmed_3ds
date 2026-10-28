@@ -139,17 +139,18 @@ struct retro_video_views
    unsigned recommended_view_height;
 };
 #endif
-static void *stereo_buf;
+static void *stereo_buf;                 /* both eyes side by side, sent to the frontend */
 static bool stereo_map_sent;
-/* where the displayed picture sits in vout_buf (filled by vout_flip) */
-static int vout_img_x, vout_img_y, vout_img_w, vout_img_h, vout_img_ok;
+static void *vout_buf_r;                 /* right eye picture (same layout as vout_buf) */
+static int vout_r_ok;                    /* right eye picture of this frame is valid */
+static int vout_img_ok;                  /* picture is in a mode the stereo code can handle */
 #ifdef _3DS
-/* draw-order depth map kept by the Unai GPU plugin (plugins/gpu_unai) */
-extern unsigned short *gpu_unai_depth;
-extern int gpu_unai_depth_on;
-extern int gpu_unai_depth_disp_x, gpu_unai_depth_disp_y;
-extern unsigned gpu_unai_depth_disp_n;
+static void *vram_r_mem;                 /* right eye frame buffer for the GPU plugin */
+/* provided by plugins/gpu_unai */
+extern unsigned short *gpu_unai_vram_r;
+extern int gpu_unai_stereo_on, gpu_unai_stereo_resync, gpu_unai_stereo_strength;
 extern unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
+extern void gpu_unai_stereo_scale_update(void);
 #endif
 static void *vout_buf;
 static void *vout_buf_ptr;
@@ -468,9 +469,10 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
    int w_blit = min(w, vout_width);
    int port = 0, hwrapped;
    int sstride = 2048;
+   int vram_ofs0 = vram_ofs, w_blit0, h_r;
+   unsigned char *dest_r0;
 
-   vout_img_x = x; vout_img_y = y; vout_img_w = w;
-   vout_img_h = min(h, vout_height);
+   vout_r_ok = 0;
    vout_img_ok = vram != NULL && !bgr24 && !enhres && w <= vout_width
       && h < vout_height * 3 / 2;
 
@@ -483,6 +485,8 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
       else
          for (; h2-- > 0; dest2 += dstride)
             memset(dest2, 0, ll);
+      if (vout_buf_r)
+         memset(vout_buf_r, 0, dstride * vout_height);
       // blanking
       if (vram == NULL)
          goto out;
@@ -494,6 +498,9 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
    }
    h = min(h, vout_height);
    dest += x * bytes_pp + y * dstride;
+   dest_r0 = (unsigned char *)vout_buf_r + (dest - (unsigned char *)vout_buf_ptr);
+   w_blit0 = w_blit;
+   h_r = h;
 
    for (h1 = h; h1-- > 0; dest += dstride) {
       bgr_to_fb(dest, vram + vram_ofs, w_blit);
@@ -524,6 +531,22 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
                crosshairInfo.thickness, crosshairInfo.size_x, crosshairInfo.size_y);
       }
    }
+
+#ifdef _3DS
+   /* stereo: convert the right eye buffer of the GPU plugin the same way */
+   if (gpu_unai_stereo_on && gpu_unai_vram_r && vout_buf_r && vout_img_ok
+       && vout_buf_ptr == vout_buf)
+   {
+      const unsigned char *vram_r = (const unsigned char *)gpu_unai_vram_r;
+      unsigned char *dr = dest_r0;
+      int ofs = vram_ofs0;
+      for (h1 = h_r; h1-- > 0; dr += dstride) {
+         bgr_to_fb(dr, vram_r + ofs, w_blit0);
+         ofs = (ofs + sstride) & vram_mask;
+      }
+      vout_r_ok = 1;
+   }
+#endif
 
 out:
    vout_fb_dirty = 1;
@@ -1269,7 +1292,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
-   info->library_version  = "r26" GIT_VERSION " STEREO-v8";
+   info->library_version  = "r26" GIT_VERSION " STEREO-DUAL-v9";
    info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
    info->need_fullpath    = true;
 }
@@ -3546,9 +3569,8 @@ static bool get_bios_config_hle(void);
 static void prepare_bios(bool use_hle);
 
 /* ---- stereo3d section ----
- * Packs the finished frame as [left eye | right eye] side by side and tells
- * the frontend where each eye is. Each eye is shifted by per-pixel depth
- * (draw order rank from the Unai GPU plugin). */
+ * Both eyes are rendered by the GPU plugin (dual pass). Here the two finished
+ * pictures are packed side by side and the frontend is told where each eye is. */
 static bool stereo_wanted(void)
 {
    unsigned status = 0;
@@ -3593,7 +3615,7 @@ static void stereo_clear_map(void)
 }
 
 /* Tells the user what the stereo code is doing; every message starts with
- * "STEREO v8" so it is obvious that this modified core is the one running. */
+ * "STEREO v9" so it is obvious that this modified core is the one running. */
 static void stereo_status(int code, const char *txt)
 {
    static int last = -1;
@@ -3608,264 +3630,74 @@ static void stereo_status(int code, const char *txt)
  * and of the nearest object (scaled by the 3DS slider). */
 #define STEREO_STRENGTH_PX 12
 
-/* work arrays for one picture row */
-static unsigned short stereo_v[640];        /* depth value of each output pixel */
-static signed char stereo_half[640];        /* sideways shift of each output pixel */
-static unsigned char stereo_row8[640 * 4];  /* source row scaled to the eye width */
-
-struct stereo_ctx {
-   int we, xstep;                  /* eye width, 16.16 source step */
-   int dx0, vfar, rcpn, strength;  /* depth map origin, depth scale, shift strength */
-};
-static struct stereo_ctx stereo_c;
-
-/* Row builder in two pixel sizes. Depth -> sideways shift per pixel; pixels
- * with the same shift form runs that are copied as blocks (the nearer run wins
- * on overlap, gaps are filled with the farther neighbour). */
-static void stereo_run_16(unsigned short *dst, const unsigned short *srow, int xs, int xe, int off, int we,
-      int *pend, int *zend, int *started)
+/* Packs one row of one eye into the eye width (320 px max; wider PS1 modes
+ * are squeezed by dropping pixels). */
+static void stereo_pack_row(unsigned char *dst, const unsigned char *src,
+      int w, int we, int bpp)
 {
-   int d0 = xs + off, d1 = xe + off, ss = xs, i;
-   int zs = stereo_v[xs], ze = stereo_v[xe - 1];
-   if (d0 < 0) { ss += -d0; d0 = 0; }
-   if (d1 > we) d1 = we;
-   if (d1 <= d0)
+   int xo, xstep;
+   if (w == we) {
+      memcpy(dst, src, w * bpp);
       return;
-   if (!*started) {
-      for (i = 0; i < d0; i++)
-         dst[i] = srow[ss];
-      *started = 1;
-   } else if (d0 > *pend) {
-      unsigned short fill = (*zend < zs) ? dst[*pend - 1] : srow[ss];
-      for (i = *pend; i < d0; i++)
-         dst[i] = fill;
-   } else if (d0 < *pend) {
-      if (zs < *zend) {          /* the earlier run is nearer: keep it */
-         ss += *pend - d0; d0 = *pend;
-         if (d1 <= d0)
-            return;
-      }
    }
-   memcpy(dst + d0, srow + ss, (d1 - d0) * sizeof(unsigned short));
-   if (d1 >= *pend) { *pend = d1; *zend = ze; }
-}
-
-static void stereo_row_16(const unsigned short *src, unsigned short *dl, unsigned short *dr, const unsigned short *drow,
-      int vimg_x, int vimg_w)
-{
-   const struct stereo_ctx *c = &stereo_c;
-   int we = c->we, xo, xs = 0, cur = 0;
-   int pl = 0, zl = 0, sl = 0, pr = 0, zr = 0, sr = 0;
-   unsigned short *srow = (unsigned short *)stereo_row8;
-
-   for (xo = 0; xo < we; xo++) {
-      int sx = (xo * c->xstep) >> 16, v = 0, n, h;
-      if (drow) {
-         int vx = sx - vimg_x;
-         if ((unsigned)vx < (unsigned)vimg_w)
-            v = drow[(c->dx0 + vx) & 1023];
-      }
-      srow[xo] = src[sx];
-      stereo_v[xo] = v;
-      n = ((v - c->vfar) * c->rcpn) >> 16;
-      if (n < 0) n = 0; else if (n > 256) n = 256;
-      h = ((n - 128) * c->strength * 8) >> 9;               /* 1/8 pixel */
-      stereo_half[xo] = (signed char)(h >= 0 ? (h + 4) >> 3 : -((-h + 4) >> 3));
+   xstep = (w << 16) / we;
+   if (bpp == 4) {
+      const unsigned int *s = (const unsigned int *)src;
+      unsigned int *d = (unsigned int *)dst;
+      for (xo = 0; xo < we; xo++)
+         d[xo] = s[(xo * xstep) >> 16];
+   } else {
+      const unsigned short *s = (const unsigned short *)src;
+      unsigned short *d = (unsigned short *)dst;
+      for (xo = 0; xo < we; xo++)
+         d[xo] = s[(xo * xstep) >> 16];
    }
-   cur = stereo_half[0];
-   for (xo = 1; xo <= we; xo++) {
-      if (xo == we || stereo_half[xo] != cur) {
-         stereo_run_16(dl, srow, xs, xo,  cur, we, &pl, &zl, &sl);
-         stereo_run_16(dr, srow, xs, xo, -cur, we, &pr, &zr, &sr);
-         if (xo < we) cur = stereo_half[xo];
-         xs = xo;
-      }
-   }
-   for (xo = pl; xo < we; xo++)
-      dl[xo] = pl ? dl[pl - 1] : srow[0];
-   for (xo = pr; xo < we; xo++)
-      dr[xo] = pr ? dr[pr - 1] : srow[0];
-}
-
-static void stereo_run_32(unsigned int *dst, const unsigned int *srow, int xs, int xe, int off, int we,
-      int *pend, int *zend, int *started)
-{
-   int d0 = xs + off, d1 = xe + off, ss = xs, i;
-   int zs = stereo_v[xs], ze = stereo_v[xe - 1];
-   if (d0 < 0) { ss += -d0; d0 = 0; }
-   if (d1 > we) d1 = we;
-   if (d1 <= d0)
-      return;
-   if (!*started) {
-      for (i = 0; i < d0; i++)
-         dst[i] = srow[ss];
-      *started = 1;
-   } else if (d0 > *pend) {
-      unsigned int fill = (*zend < zs) ? dst[*pend - 1] : srow[ss];
-      for (i = *pend; i < d0; i++)
-         dst[i] = fill;
-   } else if (d0 < *pend) {
-      if (zs < *zend) {          /* the earlier run is nearer: keep it */
-         ss += *pend - d0; d0 = *pend;
-         if (d1 <= d0)
-            return;
-      }
-   }
-   memcpy(dst + d0, srow + ss, (d1 - d0) * sizeof(unsigned int));
-   if (d1 >= *pend) { *pend = d1; *zend = ze; }
-}
-
-static void stereo_row_32(const unsigned int *src, unsigned int *dl, unsigned int *dr, const unsigned short *drow,
-      int vimg_x, int vimg_w)
-{
-   const struct stereo_ctx *c = &stereo_c;
-   int we = c->we, xo, xs = 0, cur = 0;
-   int pl = 0, zl = 0, sl = 0, pr = 0, zr = 0, sr = 0;
-   unsigned int *srow = (unsigned int *)stereo_row8;
-
-   for (xo = 0; xo < we; xo++) {
-      int sx = (xo * c->xstep) >> 16, v = 0, n, h;
-      if (drow) {
-         int vx = sx - vimg_x;
-         if ((unsigned)vx < (unsigned)vimg_w)
-            v = drow[(c->dx0 + vx) & 1023];
-      }
-      srow[xo] = src[sx];
-      stereo_v[xo] = v;
-      n = ((v - c->vfar) * c->rcpn) >> 16;
-      if (n < 0) n = 0; else if (n > 256) n = 256;
-      h = ((n - 128) * c->strength * 8) >> 9;               /* 1/8 pixel */
-      stereo_half[xo] = (signed char)(h >= 0 ? (h + 4) >> 3 : -((-h + 4) >> 3));
-   }
-   cur = stereo_half[0];
-   for (xo = 1; xo <= we; xo++) {
-      if (xo == we || stereo_half[xo] != cur) {
-         stereo_run_32(dl, srow, xs, xo,  cur, we, &pl, &zl, &sl);
-         stereo_run_32(dr, srow, xs, xo, -cur, we, &pr, &zr, &sr);
-         if (xo < we) cur = stereo_half[xo];
-         xs = xo;
-      }
-   }
-   for (xo = pl; xo < we; xo++)
-      dl[xo] = pl ? dl[pl - 1] : srow[0];
-   for (xo = pr; xo < we; xo++)
-      dr[xo] = pr ? dr[pr - 1] : srow[0];
 }
 
 /* returns true if the packed frame was sent */
 static bool stereo_present(void)
 {
 #ifdef _3DS
-   int bytes_pp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
-   int w = vout_width, we, row_b, y;
-   const unsigned char *src = vout_buf_ptr;
+   int bpp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
+   int w = vout_width, we, y, row_b;
+   const unsigned char *src_l = vout_buf_ptr, *src_r = vout_buf_r;
    unsigned char *dst = stereo_buf;
-   static int vfar_s, vnear_s;
    static unsigned frame_ctr, last_hit, last_miss, last_rec;
 
    if (!stereo_wanted()) {
-      stereo_status(0, "STEREO v8: 3D off (set 3DS Display Mode = 3D, raise slider)");
+      stereo_status(0, "STEREO v9: 3D off (set 3DS Display Mode = 3D, raise slider)");
       stereo_clear_map();
       return false;
    }
-   if (!stereo_buf || !src || !gpu_unai_depth) {
-      stereo_status(1, "STEREO v8: no depth buffer");
-      stereo_clear_map();
-      return false;
-   }
-   /* wide PS1 modes (e.g. 512 px) are squeezed to 320 px per eye so that
-    * both eyes fit into the 640 px wide frame the frontend accepts */
    we = w > 320 ? 320 : w;
-   if (!vout_img_ok || w <= 0 || vout_height <= 0 || we * 2 > VOUT_MAX_WIDTH) {
+   if (!stereo_buf || !src_l || !src_r || !vout_img_ok || !vout_r_ok
+       || w <= 0 || vout_height <= 0 || we * 2 > VOUT_MAX_WIDTH) {
       static char msg[96];
       snprintf(msg, sizeof(msg),
-         "STEREO v8: 3D unavailable (w=%d ok=%d)", w, vout_img_ok);
+         "STEREO v9: 3D unavailable (w=%d ok=%d r=%d)", w, vout_img_ok, vout_r_ok);
       stereo_status(2, msg);
       stereo_clear_map();
       return false;
    }
 
-   stereo_c.we = we;
-   stereo_c.xstep = (w << 16) / we;
-   stereo_c.dx0 = gpu_unai_depth_disp_x;
-   /* depth strength follows the 3DS slider like in native games */
-   stereo_c.strength = (int)(STEREO_STRENGTH_PX * osGet3DSliderState() + 0.5f);
-   if (stereo_c.strength < 0) stereo_c.strength = 0;
-
-   /* depth scale of this frame: the 5% / 95% points of the depth values seen
-    * on screen are mapped to far / near (smoothed over time) */
-   {
-      static unsigned hist[1024];
-      unsigned cnt = 0, acc = 0, lo_bin = 0, hi_bin = 1023;
-      int iy, xo, range;
-
-      memset(hist, 0, sizeof(hist));
-      for (iy = 0; iy < vout_img_h; iy += 4) {
-         const unsigned short *dr = gpu_unai_depth
-            + (((gpu_unai_depth_disp_y + iy) & 511) << 10);
-         for (xo = 0; xo < we; xo += 4) {
-            int sx = (xo * stereo_c.xstep) >> 16, vx = sx - vout_img_x;
-            if ((unsigned)vx < (unsigned)vout_img_w) {
-               unsigned v = dr[(stereo_c.dx0 + vx) & 1023];
-               if (v && v != 65535) { hist[v >> 6]++; cnt++; }
-            }
-         }
-      }
-      if (cnt >= 100) {
-         unsigned b;
-         for (b = 0, acc = 0; b < 1024; b++) {
-            acc += hist[b];
-            if (acc * 100 >= cnt * 5) { lo_bin = b; break; }
-         }
-         for (b = 0, acc = 0; b < 1024; b++) {
-            acc += hist[b];
-            if (acc * 100 >= cnt * 95) { hi_bin = b; break; }
-         }
-         {
-            int far_v = (int)(lo_bin << 6), near_v = (int)((hi_bin << 6) + 63);
-            if (near_v - far_v < 1024) {
-               int mid = (near_v + far_v) / 2;
-               far_v = mid - 512; near_v = mid + 512;
-            }
-            if (!vnear_s) { vfar_s = far_v; vnear_s = near_v; }
-            else { vfar_s = (vfar_s * 3 + far_v) >> 2; vnear_s = (vnear_s * 3 + near_v) >> 2; }
-         }
-      }
-      if (!vnear_s) { vfar_s = 0; vnear_s = 65534; }
-      range = vnear_s - vfar_s;
-      if (range < 1024) range = 1024;
-      stereo_c.vfar = vfar_s;
-      stereo_c.rcpn = (256 << 16) / range;
-   }
-
-   row_b = we * bytes_pp;
+   row_b = we * bpp;
    for (y = 0; y < vout_height; y++) {
-      const unsigned short *drow = NULL;
-      int iy = y - vout_img_y;
-
-      if (iy >= 0 && iy < vout_img_h)
-         drow = gpu_unai_depth + (((gpu_unai_depth_disp_y + iy) & 511) << 10);
-
-      if (bytes_pp == 4)
-         stereo_row_32((const unsigned int *)src, (unsigned int *)dst,
-            (unsigned int *)(dst + row_b), drow, vout_img_x, vout_img_w);
-      else
-         stereo_row_16((const unsigned short *)src, (unsigned short *)dst,
-            (unsigned short *)(dst + row_b), drow, vout_img_x, vout_img_w);
-
-      src += vout_pitch_b;
+      stereo_pack_row(dst, src_l, w, we, bpp);
+      stereo_pack_row(dst + row_b, src_r, w, we, bpp);
+      src_l += vout_pitch_b;
+      src_r += vout_pitch_b;
       dst += row_b * 2;
    }
 
    stereo_send_map(we, vout_height);
-   stereo_status(3, "STEREO v8: 3D ON");
+   stereo_status(3, "STEREO v9: 3D ON");
 
    /* diagnostics: how many vertices got their real depth from the GTE */
    if (++frame_ctr % 120 == 0) {
       static char dmsg[96];
       unsigned h = gpu_unai_zhit - last_hit, m = gpu_unai_zmiss - last_miss;
       unsigned r = gpu_unai_zrec - last_rec;
-      snprintf(dmsg, sizeof(dmsg), "STEREO v8: gte=%u hit=%u%%", r,
+      snprintf(dmsg, sizeof(dmsg), "STEREO v9: gte=%u hit=%u%%", r,
          (h + m) ? h * 100 / (h + m) : 0);
       show_notification(dmsg, 2500, 1, RETRO_LOG_INFO);
       last_hit = gpu_unai_zhit; last_miss = gpu_unai_zmiss; last_rec = gpu_unai_zrec;
@@ -3882,7 +3714,19 @@ static bool stereo_present(void)
 void retro_run(void)
 {
 #ifdef _3DS
-   gpu_unai_depth_on = stereo_wanted();
+   {
+      /* stereo: tell the GPU plugin whether to draw both eyes this frame */
+      int want = stereo_wanted() && vout_buf_r && gpu_unai_vram_r
+                 && vout_buf_ptr == vout_buf;
+      if (want && !gpu_unai_stereo_on)
+         gpu_unai_stereo_resync = 1;
+      gpu_unai_stereo_on = want;
+      if (want) {
+         int st = (int)(STEREO_STRENGTH_PX * osGet3DSliderState() + 0.5f);
+         gpu_unai_stereo_strength = st < 0 ? 0 : st;
+         gpu_unai_stereo_scale_update();
+      }
+   }
 #endif
    //SysReset must be run while core is running,Not in menu (Locks up Retroarch)
    if (reset_pending)
@@ -4361,9 +4205,18 @@ void retro_init(void)
 
    vout_buf_ptr = vout_buf;
 
+#ifdef _3DS
+   /* stereo: right eye buffers (the picture and the GPU frame buffer) and the
+    * packed frame for the frontend */
+   vram_r_mem = linearMemAlign(1024*1024, 4096);
+   gpu_unai_vram_r = (unsigned short *)vram_r_mem;
+   if (vram_r_mem)
+      memset(vram_r_mem, 0, 1024*1024);
+   vout_buf_r = calloc(vout_buf_size, 1);
    stereo_buf = malloc(vout_buf_size);
    if (stereo_buf)
       memset(stereo_buf, 0, vout_buf_size);
+#endif
 
    loadPSXBios();
 
@@ -4401,15 +4254,21 @@ void retro_deinit(void)
    }
    SysClose();
 #ifdef _3DS
+   gpu_unai_stereo_on = 0;
+   gpu_unai_vram_r = NULL;
+   linearFree(vram_r_mem);
+   vram_r_mem = NULL;
+   free(vout_buf_r);
+   vout_buf_r = NULL;
+   free(stereo_buf);
+   stereo_buf = NULL;
+   stereo_map_sent = false;
    linearFree(vram_mem);
    vram_mem = NULL;
 #else
    free(vout_buf);
 #endif
    vout_buf = NULL;
-   free(stereo_buf);
-   stereo_buf = NULL;
-   stereo_map_sent = false;
 
 #ifdef VITA
    deinit_vita_mmap();
