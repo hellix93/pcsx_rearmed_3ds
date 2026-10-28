@@ -70,7 +70,7 @@ unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
 // "screen position of a vertex -> its depth", filled from the GTE (RTPS/RTPT
 // results) and read when the polygon packet arrives. v = 65534*64/z, so
 // larger = nearer and v is linear in screen space.
-#define ZCACHE_BITS 14
+#define ZCACHE_BITS 16
 struct zcache_ent { u32 key; u32 v; };
 static zcache_ent zcache[1 << ZCACHE_BITS];
 static unsigned zhist[1024];
@@ -100,6 +100,18 @@ extern "C" void gpu_unai_depth_record_rtpt(const unsigned int *cp2d)
   zcache_put(cp2d[12], cp2d[17] & 0xffff);
   zcache_put(cp2d[13], cp2d[18] & 0xffff);
   zcache_put(cp2d[14], cp2d[19] & 0xffff);
+}
+
+signed char gpu_vshift_buf[GPU_VSHIFT_MAX];
+int gpu_vshift_n, gpu_vshift_pos;
+
+// remember a depth worked out for a vertex the GTE did not report, so that
+// every polygon sharing that vertex uses the same one
+void gpu_depth_store(u32 key, int v)
+{
+  zcache_ent *e = &zcache[zcache_idx(key)];
+  e->key = key;
+  e->v = (u32)v;
 }
 
 int gpu_depth_lookup(u32 key)
@@ -788,12 +800,14 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
   memcpy(ex2, ex_regs, sizeof(ex2));
 
   gpu_unai_eye = 1;
+  gpu_vshift_n = 0;
   ret = unai_do_cmd_list(list_, list_len, ex_regs,
           cycles_sum_out, cycles_last, last_cmd);
 
   gpu_unai = saved_state;
   d_last = *cycles_last;
   gpu_unai_eye = -1;
+  gpu_vshift_pos = 0;
   unai_do_cmd_list(list_, list_len, ex2, &d_sum, &d_last, &d_cmd);
 
   gpu_unai_eye = 0;

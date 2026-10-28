@@ -454,14 +454,22 @@ extern unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
 
 int gpu_depth_lookup(u32 key);
 
-// sideways shift (pixels) of a vertex with depth value v for the current eye
-static inline int gpu_stereo_shift(int v)
+// sideways shift (pixels) of a vertex with depth value v: positive for near
+// things; the left eye adds it, the right eye subtracts it
+static inline int gpu_stereo_half(int v)
 {
 	int n = ((v - gpu_unai_stereo_vfar) * gpu_unai_stereo_rcpn) >> 16;
 	if (n < 0) n = 0; else if (n > 256) n = 256;
 	int h = ((n - 128) * gpu_unai_stereo_strength * 8) >> 9;      // 1/8 pixel
-	int half = h >= 0 ? (h + 4) >> 3 : -((-h + 4) >> 3);
-	return gpu_unai_eye * half;
+	return h >= 0 ? (h + 4) >> 3 : -((-h + 4) >> 3);
 }
+
+// The left eye pass works out the shift of every polygon vertex and writes it
+// here; the right eye pass reads the very same numbers back, so both eyes
+// always agree and shared polygon edges stay closed.
+#define GPU_VSHIFT_MAX 131072
+extern signed char gpu_vshift_buf[GPU_VSHIFT_MAX];
+extern int gpu_vshift_n, gpu_vshift_pos;
+void gpu_depth_store(u32 key, int v);
 
 #endif // GPU_UNAI_H

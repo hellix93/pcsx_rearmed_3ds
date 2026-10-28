@@ -86,9 +86,10 @@ static void polyInitVertexBuffer(PolyVertex *vbuf, const PtrUnion packet, PolyTy
 		vbuf[i].y = GPU_EXPANDSIGN(coords >> 16);
 	}
 
-	// Stereo: move every vertex sideways by its depth (different for each eye)
-	if (gpu_unai_eye) {
-		int vv[4], known = 0, sum = 0;
+	// Stereo: move every vertex sideways by its depth. The left eye pass looks
+	// the depths up and records the shifts, the right eye pass reuses them.
+	if (gpu_unai_eye > 0) {
+		int vv[4], hh[4] = {0, 0, 0, 0}, known = 0, sum = 0;
 		ptr = &packet.U4[1];
 		for (int i=0;  i < num_verts; ++i, ptr += vert_stride) {
 			vv[i] = gpu_depth_lookup(le32_to_u32(*ptr));
@@ -96,8 +97,26 @@ static void polyInitVertexBuffer(PolyVertex *vbuf, const PtrUnion packet, PolyTy
 		}
 		if (known) {
 			int avg = sum / known;
-			for (int i=0;  i < num_verts; ++i)
-				vbuf[i].x += gpu_stereo_shift(vv[i] >= 0 ? vv[i] : avg);
+			ptr = &packet.U4[1];
+			for (int i=0;  i < num_verts; ++i, ptr += vert_stride) {
+				if (vv[i] < 0) {
+					vv[i] = avg;
+					gpu_depth_store(le32_to_u32(*ptr), avg);
+				}
+				hh[i] = gpu_stereo_half(vv[i]);
+			}
+		}
+		for (int i=0;  i < num_verts; ++i) {
+			vbuf[i].x += hh[i];
+			if (gpu_vshift_n < GPU_VSHIFT_MAX)
+				gpu_vshift_buf[gpu_vshift_n] = (signed char)hh[i];
+			gpu_vshift_n++;
+		}
+	} else if (gpu_unai_eye < 0) {
+		for (int i=0;  i < num_verts; ++i) {
+			if (gpu_vshift_pos < gpu_vshift_n && gpu_vshift_pos < GPU_VSHIFT_MAX)
+				vbuf[i].x -= gpu_vshift_buf[gpu_vshift_pos];
+			gpu_vshift_pos++;
 		}
 	}
 
