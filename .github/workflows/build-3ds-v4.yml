@@ -1,0 +1,56 @@
+name: Build 3DS (PCSX ReARMed stereo)
+
+# Ручной запуск: вкладка Actions -> "Build 3DS ..." -> Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Get RetroArch sources
+      run: git clone --depth 1 https://github.com/libretro/RetroArch.git ra
+
+    # Сборка идёт внутри контейнера devkitPro через docker run,
+    # а выгрузка файла (ниже) - уже на обычной машине GitHub.
+    - name: Build core and RetroArch in devkitPro container
+      run: |
+        docker run --rm --user root \
+          -v "$PWD":/work -w /work \
+          reallibretroretroarch/libretro-build-devkitpro:latest \
+          bash -c '
+            set -e
+            # свой номер приложения, чтобы не совпадать с обычным ядром PS1 (0xBAC15)
+            STEREO_ID="APP_UNIQUE_ID=0xBAF3D APP_PRODUCT_CODE=RARCH-PCSXSTEREO APP_TITLE=PCSX-STEREO"
+            JOBS=$(getconf _NPROCESSORS_ONLN)
+            make -f Makefile.libretro platform=ctr -j$JOBS
+            ls -l *.a
+            cp pcsx_rearmed_libretro_ctr.a ra/libretro_ctr.a
+            cd ra
+            make -f Makefile.ctr -j$JOBS USE_CTRULIB_2=1 LIBRETRO=pcsx_rearmed $STEREO_ID clean
+            make -f Makefile.ctr -j$JOBS USE_CTRULIB_2=1 LIBRETRO=pcsx_rearmed $STEREO_ID all
+            ls -l retroarch_3ds.*
+          '
+
+    - name: Collect result
+      run: |
+        mkdir -p out
+        cp ra/retroarch_3ds.cia out/pcsx_rearmed_libretro.cia
+        cp ra/retroarch_3ds.3dsx ra/retroarch_3ds.smdh out/ || true
+        # the .elf has the function names: with the "PC" address from a crash
+        # screen it shows where the program crashed
+        cp ra/retroarch_3ds.elf out/pcsx_stereo.elf || true
+        ls -l out
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: pcsx-rearmed-3ds-stereo
+        path: out/
+        if-no-files-found: error
