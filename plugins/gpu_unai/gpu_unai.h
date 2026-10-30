@@ -471,5 +471,27 @@ static inline int gpu_stereo_half(int v)
 extern signed char gpu_vshift_buf[GPU_VSHIFT_MAX];
 extern int gpu_vshift_n, gpu_vshift_pos;
 void gpu_depth_store(u32 key, int v);
+extern int gpu_stereo_lastv;   // depth of the last 3D polygon drawn in this frame (1 = far)
+
+// Small sprites and tiles (stars, particles, HUD) have no depth of their own:
+// they take the depth of the last 3D polygon drawn before them. Same recording
+// scheme as for polygon vertices, one number per primitive.
+static inline int gpu_stereo_prim_shift(u32 w, u32 h)
+{
+	if (gpu_unai_eye > 0) {
+		int half = (w <= 64 && h <= 64) ? gpu_stereo_half(gpu_stereo_lastv) : 0;
+		if (gpu_vshift_n < GPU_VSHIFT_MAX)
+			gpu_vshift_buf[gpu_vshift_n] = (signed char)half;
+		gpu_vshift_n++;
+		return half;
+	} else if (gpu_unai_eye < 0) {
+		int half = 0;
+		if (gpu_vshift_pos < gpu_vshift_n && gpu_vshift_pos < GPU_VSHIFT_MAX)
+			half = gpu_vshift_buf[gpu_vshift_pos];
+		gpu_vshift_pos++;
+		return -half;
+	}
+	return 0;
+}
 
 #endif // GPU_UNAI_H

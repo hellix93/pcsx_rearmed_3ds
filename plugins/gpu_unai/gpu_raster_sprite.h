@@ -37,6 +37,7 @@ void gpuDrawS(PtrUnion packet, const PS gpuSpriteDriver, s32 *w_out, s32 *h_out)
 
 	u32 w = le16_to_u16(packet.U2[6]) & 0x3ff; // Max width is 1023
 	u32 h = le16_to_u16(packet.U2[7]) & 0x1ff; // Max height is 511
+	x0 += gpu_stereo_prim_shift(w, h);
 	x1 = x0 + w;
 	y1 = y0 + h;
 
@@ -86,6 +87,7 @@ void gpuDrawT(PtrUnion packet, const PT gpuTileDriver, s32 *w_out, s32 *h_out)
 
 	u32 w = le16_to_u16(packet.U2[4]) & 0x3ff; // Max width is 1023
 	u32 h = le16_to_u16(packet.U2[5]) & 0x1ff; // Max height is 511
+	x0 += gpu_stereo_prim_shift(w, h);
 	x1 = x0 + w;
 	y1 = y0 + h;
 

@@ -95,8 +95,12 @@ static void polyInitVertexBuffer(PolyVertex *vbuf, const PtrUnion packet, PolyTy
 			vv[i] = gpu_depth_lookup(le32_to_u32(*ptr));
 			if (vv[i] >= 0) { sum += vv[i]; known++; }
 		}
-		if (known) {
+		// A vertex position can coincide with a vertex of some other 3D polygon by
+		// chance (2D windows, text); only believe polygons where at least two
+		// vertices, and half of them, have a depth.
+		if (known >= 2 && known * 2 >= num_verts) {
 			int avg = sum / known;
+			gpu_stereo_lastv = avg;
 			ptr = &packet.U4[1];
 			for (int i=0;  i < num_verts; ++i, ptr += vert_stride) {
 				if (vv[i] < 0) {

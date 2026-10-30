@@ -104,6 +104,7 @@ extern "C" void gpu_unai_depth_record_rtpt(const unsigned int *cp2d)
 
 signed char gpu_vshift_buf[GPU_VSHIFT_MAX];
 int gpu_vshift_n, gpu_vshift_pos;
+int gpu_stereo_lastv = 1;
 
 // remember a depth worked out for a vertex the GTE did not report, so that
 // every polygon sharing that vertex uses the same one
@@ -151,10 +152,18 @@ extern "C" void gpu_unai_stereo_scale_update(void)
       far_v = mid - 512; near_v = mid + 512;
     }
     if (!vnear_s) { vfar_s = far_v; vnear_s = near_v; }
-    else { vfar_s = (vfar_s * 3 + far_v) >> 2; vnear_s = (vnear_s * 3 + near_v) >> 2; }
+    else {
+      // follow slowly so that things appearing and disappearing (blinking text)
+      // do not make the whole picture breathe; follow fast after a scene change
+      int range = vnear_s - vfar_s;
+      int big = (far_v - vfar_s > range / 2) || (vfar_s - far_v > range / 2)
+             || (near_v - vnear_s > range / 2) || (vnear_s - near_v > range / 2);
+      if (big) { vfar_s = (vfar_s * 3 + far_v) >> 2; vnear_s = (vnear_s * 3 + near_v) >> 2; }
+      else { vfar_s = (vfar_s * 31 + far_v) >> 5; vnear_s = (vnear_s * 31 + near_v) >> 5; }
+    }
   }
   for (b = 0; b < 1024; b++)
-    zhist[b] >>= 1;
+    zhist[b] -= zhist[b] >> 3;
   if (!vnear_s) { vfar_s = 0; vnear_s = 65534; }
   gpu_unai_stereo_vfar = vfar_s;
   gpu_unai_stereo_rcpn = (256 << 16) / (vnear_s - vfar_s);
@@ -211,6 +220,7 @@ void renderer_finish(void)
 
 void renderer_notify_screen_change(const struct psx_gpu_screen *screen)
 {
+  gpu_stereo_lastv = 1;   // a new frame starts at the far end
   gpu_unai.inn.ilace_mask = gpu_unai.config.ilace_force;
 
   if (gpu.state.downscale_enable)
