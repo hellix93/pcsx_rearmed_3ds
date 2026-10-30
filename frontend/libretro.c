@@ -1292,7 +1292,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
-   info->library_version  = "r26" GIT_VERSION " STEREO-DUAL-v10";
+   info->library_version  = "r26" GIT_VERSION " STEREO-DUAL-v11";
    info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
    info->need_fullpath    = true;
 }
@@ -3615,7 +3615,7 @@ static void stereo_clear_map(void)
 }
 
 /* Tells the user what the stereo code is doing; every message starts with
- * "STEREO v10" so it is obvious that this modified core is the one running. */
+ * "STEREO v11" so it is obvious that this modified core is the one running. */
 static void stereo_status(int code, const char *txt)
 {
    static int last = -1;
@@ -3675,7 +3675,7 @@ static bool stereo_present(void)
        || w <= 0 || vout_height <= 0 || we * 2 > VOUT_MAX_WIDTH) {
       static char msg[96];
       snprintf(msg, sizeof(msg),
-         "STEREO v10: 3D unavailable (w=%d ok=%d r=%d)", w, vout_img_ok, vout_r_ok);
+         "STEREO v11: 3D unavailable (w=%d ok=%d r=%d)", w, vout_img_ok, vout_r_ok);
       stereo_status(2, msg);
       stereo_clear_map();
       return false;
@@ -3693,7 +3693,7 @@ static bool stereo_present(void)
    stereo_send_map(we, vout_height);
    if (!banner_shown) {
       banner_shown = 1;
-      show_notification("STEREO v10", 2500, 1, RETRO_LOG_INFO);
+      show_notification("STEREO v11", 2500, 1, RETRO_LOG_INFO);
    }
 
    /* diagnostics: how many vertices got their real depth from the GTE
@@ -3702,7 +3702,7 @@ static bool stereo_present(void)
       static char dmsg[96];
       unsigned h = gpu_unai_zhit - last_hit, m = gpu_unai_zmiss - last_miss;
       unsigned r = gpu_unai_zrec - last_rec;
-      snprintf(dmsg, sizeof(dmsg), "STEREO v10: gte=%u hit=%u%%", r,
+      snprintf(dmsg, sizeof(dmsg), "STEREO v11: gte=%u hit=%u%%", r,
          (h + m) ? h * 100 / (h + m) : 0);
       show_notification(dmsg, 2500, 1, RETRO_LOG_INFO);
       last_hit = gpu_unai_zhit; last_miss = gpu_unai_zmiss; last_rec = gpu_unai_zrec;
