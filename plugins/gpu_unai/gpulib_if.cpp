@@ -104,7 +104,6 @@ extern "C" void gpu_unai_depth_record_rtpt(const unsigned int *cp2d)
 
 signed char gpu_vshift_buf[GPU_VSHIFT_MAX];
 int gpu_vshift_n, gpu_vshift_pos;
-int gpu_stereo_lastv = 1;
 
 // remember a depth worked out for a vertex the GTE did not report, so that
 // every polygon sharing that vertex uses the same one
@@ -220,7 +219,6 @@ void renderer_finish(void)
 
 void renderer_notify_screen_change(const struct psx_gpu_screen *screen)
 {
-  gpu_stereo_lastv = 1;   // a new frame starts at the far end
   gpu_unai.inn.ilace_mask = gpu_unai.config.ilace_force;
 
   if (gpu.state.downscale_enable)
