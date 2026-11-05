@@ -66,7 +66,8 @@ int gpu_unai_stereo_on, gpu_unai_stereo_req, gpu_unai_stereo_strength;
 unsigned gpu_unai_prof_l, gpu_unai_prof_r;
 static volatile unsigned short zgen;      // advances once per emulated frame
 #ifdef _3DS
-#include <3ds/svc.h>
+/* system timer of the 3DS (library function written in C / assembly) */
+extern "C" unsigned long long svcGetSystemTick(void);
 #define PROF_TICK() ((unsigned)svcGetSystemTick())
 #else
 #define PROF_TICK() 0u
