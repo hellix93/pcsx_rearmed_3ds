@@ -62,7 +62,15 @@
 
 // ----- stereo mod: globals, GTE depth cache, depth scale -----
 unsigned short *gpu_unai_vram_r;
-int gpu_unai_stereo_on, gpu_unai_stereo_resync, gpu_unai_stereo_strength;
+int gpu_unai_stereo_on, gpu_unai_stereo_req, gpu_unai_stereo_strength;
+unsigned gpu_unai_prof_l, gpu_unai_prof_r;
+static volatile unsigned short zgen;      // advances once per emulated frame
+#ifdef _3DS
+#include <3ds/svc.h>
+#define PROF_TICK() ((unsigned)svcGetSystemTick())
+#else
+#define PROF_TICK() 0u
+#endif
 int gpu_unai_stereo_vfar, gpu_unai_stereo_rcpn = (256 << 16) / 65534;
 int gpu_unai_eye;
 unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
@@ -71,7 +79,7 @@ unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
 // results) and read when the polygon packet arrives. v = 65534*64/z, so
 // larger = nearer and v is linear in screen space.
 #define ZCACHE_BITS 16
-struct zcache_ent { u32 key; u32 v; };
+struct zcache_ent { u32 key; u16 v; u16 gen; };   // gen: frame the entry was made in
 static zcache_ent zcache[1 << ZCACHE_BITS];
 static unsigned zhist[1024];
 static inline u32 zcache_idx(u32 key) { return (key * 2654435761u) >> (32 - ZCACHE_BITS); }
@@ -83,20 +91,21 @@ static inline void zcache_put(u32 sxy, u32 sz)
   if (v < 1u) v = 1u;
   zcache_ent *e = &zcache[zcache_idx(sxy)];
   e->key = sxy;
-  e->v = v;
+  e->v = (u16)v;
+  e->gen = zgen;
   zhist[v >> 6]++;
   gpu_unai_zrec++;
 }
 
 extern "C" void gpu_unai_depth_record_rtps(const unsigned int *cp2d)
 {
-  if (!gpu_unai_stereo_on) return;
+  if (!gpu_unai_stereo_req && !gpu_unai_stereo_on) return;
   zcache_put(cp2d[14], cp2d[19] & 0xffff);
 }
 
 extern "C" void gpu_unai_depth_record_rtpt(const unsigned int *cp2d)
 {
-  if (!gpu_unai_stereo_on) return;
+  if (!gpu_unai_stereo_req && !gpu_unai_stereo_on) return;
   zcache_put(cp2d[12], cp2d[17] & 0xffff);
   zcache_put(cp2d[13], cp2d[18] & 0xffff);
   zcache_put(cp2d[14], cp2d[19] & 0xffff);
@@ -111,13 +120,16 @@ void gpu_depth_store(u32 key, int v)
 {
   zcache_ent *e = &zcache[zcache_idx(key)];
   e->key = key;
-  e->v = (u32)v;
+  e->v = (u16)v;
+  e->gen = zgen;
 }
 
 int gpu_depth_lookup(u32 key)
 {
   const zcache_ent *e = &zcache[zcache_idx(key)];
-  if (e->key == key && e->v) {
+  // only believe depths recorded in the last few frames: older ones belong to
+  // a different scene and would match 2D things (menus, text) by chance
+  if (e->key == key && e->v && (unsigned short)(zgen - e->gen) <= 6) {
     if (gpu_unai_eye > 0) gpu_unai_zhit++;
     return (int)e->v;
   }
@@ -129,7 +141,9 @@ int gpu_depth_lookup(u32 key)
 // recently recorded depth values are mapped to far / near (smoothed in time).
 extern "C" void gpu_unai_stereo_scale_update(void)
 {
-  static int vfar_s, vnear_s;
+  static int vfar_s, vnear_s, fast;
+  static unsigned cnt_s;
+  zgen++;
   unsigned cnt = 0, acc, b, lo = 0, hi = 1023;
 
   for (b = 0; b < 1024; b++)
@@ -150,19 +164,30 @@ extern "C" void gpu_unai_stereo_scale_update(void)
       int mid = (near_v + far_v) / 2;
       far_v = mid - 512; near_v = mid + 512;
     }
-    if (!vnear_s) { vfar_s = far_v; vnear_s = near_v; }
+    if (!vnear_s) { vfar_s = far_v; vnear_s = near_v; cnt_s = cnt; }
     else {
-      // follow slowly so that things appearing and disappearing (blinking text)
-      // do not make the whole picture breathe; follow fast after a scene change
+      // Follow slowly so that things appearing and disappearing (blinking text)
+      // do not make the whole picture breathe. A scene change (a level, a menu)
+      // shows up as a big change in how many vertices are on screen or in the
+      // depth range: then follow fast for a while.
       int range = vnear_s - vfar_s;
       int big = (far_v - vfar_s > range / 2) || (vfar_s - far_v > range / 2)
              || (near_v - vnear_s > range / 2) || (vnear_s - near_v > range / 2);
-      if (big) { vfar_s = (vfar_s * 3 + far_v) >> 2; vnear_s = (vnear_s * 3 + near_v) >> 2; }
-      else { vfar_s = (vfar_s * 31 + far_v) >> 5; vnear_s = (vnear_s * 31 + near_v) >> 5; }
+      if (cnt_s && (cnt > cnt_s * 2 || cnt * 2 < cnt_s))
+        big = 1;
+      if (big)
+        fast = 40;
+      if (fast > 0) {
+        fast--;
+        vfar_s = (vfar_s * 3 + far_v) >> 2; vnear_s = (vnear_s * 3 + near_v) >> 2;
+      } else {
+        vfar_s = (vfar_s * 31 + far_v) >> 5; vnear_s = (vnear_s * 31 + near_v) >> 5;
+      }
+      cnt_s = (cnt_s * 15 + cnt) >> 4;
     }
   }
   for (b = 0; b < 1024; b++)
-    zhist[b] -= zhist[b] >> 3;
+    zhist[b] = (zhist[b] * 7) >> 3;   /* rounds down: small counts really fade out */
   if (!vnear_s) { vfar_s = 0; vnear_s = 65534; }
   gpu_unai_stereo_vfar = vfar_s;
   gpu_unai_stereo_rcpn = (256 << 16) / (vnear_s - vfar_s);
@@ -217,8 +242,26 @@ void renderer_finish(void)
 {
 }
 
+// The stereo mode is switched only between frames: switching in the middle of a
+// frame would leave a picture made of left-eye and flat parts (frozen when the
+// game is paused).
+static int latch_wait;
+static void stereo_latch(void)
+{
+  latch_wait = 0;
+  if (gpu_unai_stereo_req == gpu_unai_stereo_on)
+    return;
+  if (gpu_unai_stereo_req && gpu_unai_vram_r) {
+    // the picture shown now becomes the start of the right eye picture
+    memcpy(gpu_unai_vram_r, (void *)gpu_unai.vram, FRAME_BUFFER_SIZE);
+    gpu_unai_stereo_on = 1;
+  } else
+    gpu_unai_stereo_on = 0;
+}
+
 void renderer_notify_screen_change(const struct psx_gpu_screen *screen)
 {
+  stereo_latch();
   gpu_unai.inn.ilace_mask = gpu_unai.config.ilace_force;
 
   if (gpu.state.downscale_enable)
@@ -793,30 +836,33 @@ int renderer_do_cmd_list(u32 *list_, int list_len, uint32_t *ex_regs,
   uint32_t ex2[8];
   int ret, d_sum = 0, d_last = 0, d_cmd = 0;
 
+  // games that never change the display address have no frame borders to wait for
+  if (gpu_unai_stereo_req != gpu_unai_stereo_on && ++latch_wait > 2000)
+    stereo_latch();
+
   if (!gpu_unai_stereo_on || !gpu_unai_vram_r || IS_OLD_RENDERER()) {
     gpu_unai_eye = 0;
     return unai_do_cmd_list(list_, list_len, ex_regs,
              cycles_sum_out, cycles_last, last_cmd);
   }
 
-  if (gpu_unai_stereo_resync) {
-    memcpy(gpu_unai_vram_r, (void *)gpu_unai.vram, FRAME_BUFFER_SIZE);
-    gpu_unai_stereo_resync = 0;
-  }
-
   saved_state = gpu_unai;
   memcpy(ex2, ex_regs, sizeof(ex2));
 
+  unsigned t0 = PROF_TICK();
   gpu_unai_eye = 1;
   gpu_vshift_n = 0;
   ret = unai_do_cmd_list(list_, list_len, ex_regs,
           cycles_sum_out, cycles_last, last_cmd);
+  unsigned t1 = PROF_TICK();
+  gpu_unai_prof_l += t1 - t0;
 
   gpu_unai = saved_state;
   d_last = *cycles_last;
   gpu_unai_eye = -1;
   gpu_vshift_pos = 0;
   unai_do_cmd_list(list_, list_len, ex2, &d_sum, &d_last, &d_cmd);
+  gpu_unai_prof_r += PROF_TICK() - t1;
 
   gpu_unai_eye = 0;
   return ret;

@@ -435,8 +435,9 @@ static inline bool ProgressiveInterlaceEnabled()
 extern "C" {
 #endif
 extern unsigned short *gpu_unai_vram_r;   // right-eye buffer, 1024x512 (set by frontend)
-extern int gpu_unai_stereo_on;            // frontend: stereo is wanted right now
-extern int gpu_unai_stereo_resync;        // frontend: copy main VRAM to right buffer
+extern int gpu_unai_stereo_req;           // frontend: stereo is wanted right now
+extern int gpu_unai_stereo_on;            // really active: follows the request at frame borders
+extern unsigned gpu_unai_prof_l, gpu_unai_prof_r;   // timing of the two passes (system ticks)
 extern int gpu_unai_stereo_strength;      // frontend: shift range in pixels (slider scaled)
 extern int gpu_unai_stereo_vfar;          // depth scale of the current scene
 extern int gpu_unai_stereo_rcpn;
