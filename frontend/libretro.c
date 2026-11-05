@@ -148,9 +148,17 @@ static int vout_img_ok;                  /* picture is in a mode the stereo code
 static void *vram_r_mem;                 /* right eye frame buffer for the GPU plugin */
 /* provided by plugins/gpu_unai */
 extern unsigned short *gpu_unai_vram_r;
-extern int gpu_unai_stereo_on, gpu_unai_stereo_resync, gpu_unai_stereo_strength;
+extern int gpu_unai_stereo_on, gpu_unai_stereo_req, gpu_unai_stereo_strength;
+extern unsigned gpu_unai_prof_l, gpu_unai_prof_r;
 extern unsigned gpu_unai_zrec, gpu_unai_zhit, gpu_unai_zmiss;
 extern void gpu_unai_stereo_scale_update(void);
+#endif
+#ifdef _3DS
+/* timing (system ticks, 268 MHz): whole retro_run, vout_flip, right eye conversion, packing */
+static unsigned prof_run, prof_vout, prof_vr, prof_pack, prof_frames;
+#define PROF_TICK() ((unsigned)svcGetSystemTick())
+#else
+#define PROF_TICK() 0u
 #endif
 static void *vout_buf;
 static void *vout_buf_ptr;
@@ -455,7 +463,21 @@ static void CrosshairDimensions(int port, struct CrosshairInfo *info) {
    info->size_y = psx_h * (pl_rearmed_cbs.gpu_neon.enhancement_enable ? 2 : 1) * (4.0f / 3.0f) / 40.0f;
 }
 
+static void vout_flip_inner(const void *vram_, int vram_ofs, int bgr24,
+      int x, int y, int w, int h, int dims_changed);
 static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
+      int x, int y, int w, int h, int dims_changed)
+{
+#ifdef _3DS
+   unsigned t = PROF_TICK();
+   vout_flip_inner(vram_, vram_ofs, bgr24, x, y, w, h, dims_changed);
+   prof_vout += PROF_TICK() - t;
+#else
+   vout_flip_inner(vram_, vram_ofs, bgr24, x, y, w, h, dims_changed);
+#endif
+}
+
+static void vout_flip_inner(const void *vram_, int vram_ofs, int bgr24,
       int x, int y, int w, int h, int dims_changed)
 {
    int bytes_pp = (current_fmt == RETRO_PIXEL_FORMAT_XRGB8888) ? 4 : 2;
@@ -540,10 +562,12 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
       const unsigned char *vram_r = (const unsigned char *)gpu_unai_vram_r;
       unsigned char *dr = dest_r0;
       int ofs = vram_ofs0;
+      unsigned tr = PROF_TICK();
       for (h1 = h_r; h1-- > 0; dr += dstride) {
          bgr_to_fb(dr, vram_r + ofs, w_blit0);
          ofs = (ofs + sstride) & vram_mask;
       }
+      prof_vr += PROF_TICK() - tr;
       vout_r_ok = 1;
    }
 #endif
@@ -1292,7 +1316,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
-   info->library_version  = "r26" GIT_VERSION " STEREO-DUAL-v12";
+   info->library_version  = "r26" GIT_VERSION " STEREO-DUAL-v13";
    info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
    info->need_fullpath    = true;
 }
@@ -3615,7 +3639,7 @@ static void stereo_clear_map(void)
 }
 
 /* Tells the user what the stereo code is doing; every message starts with
- * "STEREO v12" so it is obvious that this modified core is the one running. */
+ * "STEREO v13" so it is obvious that this modified core is the one running. */
 static void stereo_status(int code, const char *txt)
 {
    static int last = -1;
@@ -3629,7 +3653,7 @@ static void stereo_status(int code, const char *txt)
  * 320 px wide picture, between the left and right image of the farthest
  * and of the nearest object (scaled by the 3DS slider). */
 #define STEREO_STRENGTH_PX 28
-#define STEREO_DEBUG_MSG 0
+#define STEREO_DEBUG_MSG 1
 
 /* Packs one row of one eye into the eye width (320 px max; wider PS1 modes
  * are squeezed by dropping pixels). */
@@ -3663,10 +3687,13 @@ static bool stereo_present(void)
    int w = vout_width, we, y, row_b;
    const unsigned char *src_l = vout_buf_ptr, *src_r = vout_buf_r;
    unsigned char *dst = stereo_buf;
-   static unsigned frame_ctr, last_hit, last_miss, last_rec;
    static int banner_shown;
 
    if (!stereo_wanted()) {
+      stereo_clear_map();
+      return false;
+   }
+   if (!gpu_unai_stereo_on) {      /* the plugin switches at the next frame border */
       stereo_clear_map();
       return false;
    }
@@ -3675,13 +3702,14 @@ static bool stereo_present(void)
        || w <= 0 || vout_height <= 0 || we * 2 > VOUT_MAX_WIDTH) {
       static char msg[96];
       snprintf(msg, sizeof(msg),
-         "STEREO v12: 3D unavailable (w=%d ok=%d r=%d)", w, vout_img_ok, vout_r_ok);
+         "STEREO v13: 3D unavailable (w=%d ok=%d r=%d)", w, vout_img_ok, vout_r_ok);
       stereo_status(2, msg);
       stereo_clear_map();
       return false;
    }
 
    row_b = we * bpp;
+   unsigned tp = PROF_TICK();
    for (y = 0; y < vout_height; y++) {
       stereo_pack_row(dst, src_l, w, we, bpp);
       stereo_pack_row(dst + row_b, src_r, w, we, bpp);
@@ -3689,23 +3717,12 @@ static bool stereo_present(void)
       src_r += vout_pitch_b;
       dst += row_b * 2;
    }
+   prof_pack += PROF_TICK() - tp;
 
    stereo_send_map(we, vout_height);
    if (!banner_shown) {
       banner_shown = 1;
-      show_notification("STEREO v12", 2500, 1, RETRO_LOG_INFO);
-   }
-
-   /* diagnostics: how many vertices got their real depth from the GTE
-    * (set STEREO_DEBUG_MSG to 1 to see it on the screen) */
-   if (STEREO_DEBUG_MSG && ++frame_ctr % 120 == 0) {
-      static char dmsg[96];
-      unsigned h = gpu_unai_zhit - last_hit, m = gpu_unai_zmiss - last_miss;
-      unsigned r = gpu_unai_zrec - last_rec;
-      snprintf(dmsg, sizeof(dmsg), "STEREO v12: gte=%u hit=%u%%", r,
-         (h + m) ? h * 100 / (h + m) : 0);
-      show_notification(dmsg, 2500, 1, RETRO_LOG_INFO);
-      last_hit = gpu_unai_zhit; last_miss = gpu_unai_zmiss; last_rec = gpu_unai_zrec;
+      show_notification("STEREO v13", 2500, 1, RETRO_LOG_INFO);
    }
 
    video_cb(stereo_buf, we * 2, vout_height, row_b * 2);
@@ -3716,16 +3733,56 @@ static bool stereo_present(void)
 #endif
 }
 
+static void retro_run_inner(void);
+
 void retro_run(void)
 {
 #ifdef _3DS
+   unsigned t = PROF_TICK();
+   retro_run_inner();
+   prof_run += PROF_TICK() - t;
+   prof_frames++;
+
+   /* Every 120 emulated frames show how long each part took (ms per frame)
+    * and the real speed. Shown with 3D on and off, so they can be compared.
+    * run = whole retro_run, L / R = drawing the left / right eye (GPU thread,
+    * runs next to the main thread), vo / vr = picture conversion left / right,
+    * pk = packing both eyes. F = real frames per second. */
+   if (STEREO_DEBUG_MSG && prof_frames >= 120) {
+      static char dmsg[100];
+      static unsigned long long last_tick;
+      unsigned long long now = svcGetSystemTick();
+      unsigned n = prof_frames;
+      unsigned l = gpu_unai_prof_l, r = gpu_unai_prof_r;
+      unsigned fps10 = last_tick
+         ? (unsigned)((unsigned long long)n * 10ULL * 268111856ULL / (now - last_tick)) : 0;
+      /* tenths of a millisecond per emulated frame */
+      #define T10(x) ((x) / 26811 / n)
+      snprintf(dmsg, sizeof(dmsg),
+         "%s F%u.%u run%u.%u L%u.%u R%u.%u vo%u.%u vr%u.%u pk%u.%u",
+         gpu_unai_stereo_on ? "3D" : "2D", fps10 / 10, fps10 % 10,
+         T10(prof_run) / 10, T10(prof_run) % 10, T10(l) / 10, T10(l) % 10,
+         T10(r) / 10, T10(r) % 10, T10(prof_vout) / 10, T10(prof_vout) % 10,
+         T10(prof_vr) / 10, T10(prof_vr) % 10, T10(prof_pack) / 10, T10(prof_pack) % 10);
+      #undef T10
+      show_notification(dmsg, 3000, 1, RETRO_LOG_INFO);
+      last_tick = now;
+      prof_run = prof_vout = prof_vr = prof_pack = prof_frames = 0;
+      gpu_unai_prof_l = gpu_unai_prof_r = 0;
+   }
+#else
+   retro_run_inner();
+#endif
+}
+
+static void retro_run_inner(void)
+{
+#ifdef _3DS
    {
-      /* stereo: tell the GPU plugin whether to draw both eyes this frame */
+      /* stereo: ask the GPU plugin to draw both eyes (it switches at a frame border) */
       int want = stereo_wanted() && vout_buf_r && gpu_unai_vram_r
                  && vout_buf_ptr == vout_buf;
-      if (want && !gpu_unai_stereo_on)
-         gpu_unai_stereo_resync = 1;
-      gpu_unai_stereo_on = want;
+      gpu_unai_stereo_req = want;
       if (want) {
          int st = (int)(STEREO_STRENGTH_PX * osGet3DSliderState() + 0.5f);
          gpu_unai_stereo_strength = st < 0 ? 0 : st;
@@ -4259,6 +4316,7 @@ void retro_deinit(void)
    }
    SysClose();
 #ifdef _3DS
+   gpu_unai_stereo_req = 0;
    gpu_unai_stereo_on = 0;
    gpu_unai_vram_r = NULL;
    linearFree(vram_r_mem);
